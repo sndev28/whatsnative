@@ -1,39 +1,38 @@
 package ui
 
 import (
-	"fmt"
-	"reflect"
-
 	tea "charm.land/bubbletea/v2"
 )
 
-type page struct {
-	pageName string
+type Page struct {
+	pageTitle string
 	content string
 }
 
-type pageInterface interface {
+type PageInterface interface {
 	render() string
-	action(tea.Msg) (pageInterface, tea.Cmd)
+	action(tea.Msg) (PageInterface, tea.Cmd)
 }
 
-func newPage() page {
-	return page{
-		pageName: "Start",
+func newPage() Page {
+	return Page{
+		pageTitle: "Start",
 		content: "Empty page",
 	}
 }
 
-func (p page) render() (string) {
+func (p Page) render() (string) {
 	return p.content;
 }
 
-func (p page) action(event tea.Msg) (pageInterface, tea.Cmd) {
-	fmt.Printf("\r\nevent: %s", reflect.TypeOf(event))
+func (p Page) action(event tea.Msg) (PageInterface, tea.Cmd) {
+	// fmt.Printf("\r\nevent: %s", reflect.TypeOf(event))
 
 	if event, ok := event.(tea.KeyPressMsg); ok {
 		if event.String() == "ctrl+c" {
 			return p, tea.Quit
+		} else if event.String() == "enter" {
+			return openConversationsPage(), nil
 		}
 	}
 	return p, nil

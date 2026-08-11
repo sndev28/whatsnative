@@ -7,7 +7,7 @@ import (
 
 
 type viewPort struct {
-	Page pageInterface
+	page PageInterface
 }
 
 
@@ -16,19 +16,19 @@ func (v viewPort) Init() tea.Cmd {
 }
 
 func (v viewPort) View() tea.View {
-	view := tea.NewView(v.Page.render())
+	view := tea.NewView(v.page.render())
 	view.AltScreen = true
 	return view
 }
 
 func (v viewPort) Update(event tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
-	v.Page, cmd = v.Page.action(event)
+	v.page, cmd = v.page.action(event)
 	return v, cmd
 }
 
 func initializeViewPort() viewPort {
-	v := viewPort{Page: newPage()}
+	v := viewPort{page: newPage()}
 	return v
 }
 
