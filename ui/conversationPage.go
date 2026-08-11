@@ -171,19 +171,36 @@ func openConversationsPage() ConversationsPage {
 	}
 }
 
+
+
 func (c ConversationsPage) render() string {
 	s := strings.Builder{}
 
-	for _, conversation := range c.conversations {
-		if c.cursor == conversation.id {
-			fmt.Fprintf(&s, "> %s | %s \n", conversation.user.profilePic, conversation.user.name)
+	conversation := c.conversations[c.cursor]
+	
+	fmt.Fprintf(&s, "%s | %s \n", conversation.user.profilePic, conversation.user.name)
+	s.WriteString(strings.Repeat("*", 20))
+	s.WriteByte('\n')
+
+	for _, message := range conversation.messages {
+		if message.sender.activeUser {
+			fmt.Fprintf(&s, "> %s \n", message.sender.name)
 		} else {
-			fmt.Fprintf(&s, "  %s | %s \n", conversation.user.profilePic, conversation.user.name)
+			fmt.Fprintf(&s, "< %s \n", message.sender.name)
 		}
-		fmt.Fprintf(&s, "  %s\n  ", conversation.messages[len(conversation.messages)-1].content)
-		s.WriteString(strings.Repeat("_", 20))
-		s.WriteByte('\n')
+		fmt.Fprintf(&s, "  %s | %s \n", message.content, message.time)
 	}
+
+	// for _, conversation := range c.conversations {
+	// 	if c.cursor == conversation.id {
+	// 		fmt.Fprintf(&s, "> %s | %s \n", conversation.user.profilePic, conversation.user.name)
+	// 	} else {
+	// 		fmt.Fprintf(&s, "  %s | %s \n", conversation.user.profilePic, conversation.user.name)
+	// 	}
+	// 	fmt.Fprintf(&s, "  %s\n  ", conversation.messages[len(conversation.messages)-1].content)
+	// 	s.WriteString(strings.Repeat("_", 20))
+	// 	s.WriteByte('\n')
+	// }
 
 	return s.String();
 }
