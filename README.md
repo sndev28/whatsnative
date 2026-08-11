@@ -12,7 +12,7 @@
 
 ### ⚠️ Disclaimer
 
-This is a personal project to learn **Go** 🐹 and **Rust** 🦀.
+This is a personal project to learn **Go** 🐹.
 
 Feel free to use it, open issues, send PRs, all welcome! 🙌
 But I'm staying **hand-crafted, human-written** 🤚, no AI in the loop here.
