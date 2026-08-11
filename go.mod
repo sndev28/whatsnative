@@ -1,4 +1,4 @@
-module github.com/sndev28/whatsapp-native
+module whatsnative
 
 go 1.26.5
 
