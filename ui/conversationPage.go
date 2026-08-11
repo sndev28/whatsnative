@@ -46,16 +46,16 @@ func openConversationsPage() ConversationsPage {
 }
 
 func (c ConversationsPage) render() string {
-	s := ""
+	s := strings.Builder{}
 
 	for _, conversation := range c.conversations {
-		s += fmt.Sprintf("%s | %s \n", conversation.profilePic, conversation.name)
-		s += fmt.Sprintf("%s\n", conversation.lastMessage)
-		s += strings.Repeat("_", 20)
-		s += "\n"
+		fmt.Fprintf(&s, "%s | %s \n", conversation.profilePic, conversation.name)
+		fmt.Fprintf(&s, "%s\n", conversation.lastMessage)
+		s.WriteString(strings.Repeat("_", 20))
+		s.WriteByte('\n')
 	}
 
-	return s;
+	return s.String();
 }
 
 func (c ConversationsPage) action(event tea.Msg) (PageInterface, tea.Cmd) {
