@@ -3,7 +3,7 @@ package ui
 import (
 	"fmt"
 	"strings"
-	
+
 	tea "charm.land/bubbletea/v2"
 
 )
@@ -18,6 +18,7 @@ type Conversation struct {
 type ConversationsPage struct {
 	Page
 	conversations []Conversation
+	cursor int
 }
 
 func getConversations() []Conversation {
@@ -42,6 +43,7 @@ func getConversations() []Conversation {
 func openConversationsPage() ConversationsPage {
 	return ConversationsPage{
 		conversations: getConversations(),
+		cursor: 0,
 	}
 }
 
@@ -49,8 +51,12 @@ func (c ConversationsPage) render() string {
 	s := strings.Builder{}
 
 	for _, conversation := range c.conversations {
-		fmt.Fprintf(&s, "%s | %s \n", conversation.profilePic, conversation.name)
-		fmt.Fprintf(&s, "%s\n", conversation.lastMessage)
+		if c.cursor == conversation.id {
+			fmt.Fprintf(&s, "> %s | %s \n", conversation.profilePic, conversation.name)
+		} else {
+			fmt.Fprintf(&s, "  %s | %s \n", conversation.profilePic, conversation.name)
+		}
+		fmt.Fprintf(&s, "  %s\n  ", conversation.lastMessage)
 		s.WriteString(strings.Repeat("_", 20))
 		s.WriteByte('\n')
 	}
@@ -61,10 +67,15 @@ func (c ConversationsPage) render() string {
 func (c ConversationsPage) action(event tea.Msg) (PageInterface, tea.Cmd) {
 
 	if event, ok := event.(tea.KeyPressMsg); ok {
-		if event.String() == "ctrl+c" {
-			return c, tea.Quit
-		} else if event.String() == "enter" {
-			return newPage(), nil
+		switch event.String() {
+			case "ctrl+c":
+				return c, tea.Quit
+			case "down":
+				if c.cursor < len(c.conversations) - 1 {c.cursor += 1}
+			case "up": 
+				if c.cursor > 0 {c.cursor -= 1}
+			default:
+				return newPage(), nil
 		}
 	}
 
