@@ -2,6 +2,7 @@ package ui
 
 import (
 	tea "charm.land/bubbletea/v2"
+	"whatsnative/db"
 )
 
 
@@ -28,11 +29,11 @@ func (v viewPort) Update(event tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func initializeViewPort() viewPort {
-	v := viewPort{page: newPage()}
+	v := viewPort{page: openLoginPage()}
 	return v
 }
 
-func StartUI() {
+func StartUI(dbConn db.DBConn) {
 	p := tea.NewProgram(initializeViewPort())
 
 	if _, err := p.Run(); err != nil {

@@ -1,16 +1,27 @@
 package main
 
 import (
+
 	"whatsnative/ui"
 	"whatsnative/logger"
+	_ "github.com/mattn/go-sqlite3"
+
+	"whatsnative/db"
+
+
 )
+
+const DB_NAME string = "my_database.db"
+
+
 
 
 func main() {
-	dbLog, closer := logger.DbLogger()
-	defer closer.Close()
+	dbLog, logCloser := logger.DbLogger()
+	defer logCloser.Close()
 
-	dbLog.Info("Logger working")
+	dbConn, dbCloser := db.New(dbLog, DB_NAME)
+	defer dbCloser.Close()
 
-	ui.StartUI()
+	ui.StartUI(dbConn)
 }
