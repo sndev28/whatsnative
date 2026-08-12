@@ -176,6 +176,19 @@ func openConversationsPage() ConversationsPage {
 func (c ConversationsPage) render() string {
 	s := strings.Builder{}
 
+
+	for _, conversation := range c.conversations {
+		if c.cursor == conversation.id {
+			fmt.Fprintf(&s, "> %s | %s \n", conversation.user.profilePic, conversation.user.name)
+		} else {
+			fmt.Fprintf(&s, "  %s | %s \n", conversation.user.profilePic, conversation.user.name)
+		}
+		fmt.Fprintf(&s, "  %s\n  ", conversation.messages[len(conversation.messages)-1].content)
+		s.WriteString(strings.Repeat("_", 20))
+		s.WriteByte('\n')
+	}
+
+
 	conversation := c.conversations[c.cursor]
 	
 	fmt.Fprintf(&s, "%s | %s \n", conversation.user.profilePic, conversation.user.name)
@@ -191,16 +204,6 @@ func (c ConversationsPage) render() string {
 		fmt.Fprintf(&s, "  %s | %s \n", message.content, message.time)
 	}
 
-	// for _, conversation := range c.conversations {
-	// 	if c.cursor == conversation.id {
-	// 		fmt.Fprintf(&s, "> %s | %s \n", conversation.user.profilePic, conversation.user.name)
-	// 	} else {
-	// 		fmt.Fprintf(&s, "  %s | %s \n", conversation.user.profilePic, conversation.user.name)
-	// 	}
-	// 	fmt.Fprintf(&s, "  %s\n  ", conversation.messages[len(conversation.messages)-1].content)
-	// 	s.WriteString(strings.Repeat("_", 20))
-	// 	s.WriteByte('\n')
-	// }
 
 	return s.String();
 }
