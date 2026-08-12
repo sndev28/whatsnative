@@ -32,7 +32,7 @@ func (p Page) action(event tea.Msg) (PageInterface, tea.Cmd) {
 		if event.String() == "ctrl+c" {
 			return p, tea.Quit
 		} else if event.String() == "enter" {
-			return openConversationsPage(), nil
+			return openLoginPage(), nil
 		}
 	}
 	return p, nil
