@@ -31,8 +31,6 @@ func (p Page) action(event tea.Msg) (PageInterface, tea.Cmd) {
 	if event, ok := event.(tea.KeyPressMsg); ok {
 		if event.String() == "ctrl+c" {
 			return p, tea.Quit
-		} else if event.String() == "enter" {
-			return openLoginPage(), nil
 		}
 	}
 	return p, nil

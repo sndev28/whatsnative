@@ -1,12 +1,13 @@
 package main
 
 import (
+	_ "github.com/mattn/go-sqlite3"
 
 	"whatsnative/ui"
 	"whatsnative/logger"
-	_ "github.com/mattn/go-sqlite3"
 
 	"whatsnative/db"
+	clientFactory "whatsnative/client"
 
 
 )
@@ -14,14 +15,18 @@ import (
 const DB_NAME string = "my_database.db"
 
 
-
-
 func main() {
-	dbLog, logCloser := logger.DbLogger()
+	_, logCloser := logger.Logger("logs.log", true)
 	defer logCloser.Close()
+	
+	dbLog, dbLogCloser := logger.Logger("db.log", false)
+	defer dbLogCloser.Close()
 
 	dbConn, dbCloser := db.New(dbLog, DB_NAME)
 	defer dbCloser.Close()
 
-	ui.StartUI(dbConn)
+	client := clientFactory.CreateClient(dbConn)
+	defer client.Disconnect()
+
+	ui.StartUI(client)
 }

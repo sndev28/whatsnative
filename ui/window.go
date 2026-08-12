@@ -2,7 +2,7 @@ package ui
 
 import (
 	tea "charm.land/bubbletea/v2"
-	"whatsnative/db"
+	"go.mau.fi/whatsmeow"
 )
 
 
@@ -28,13 +28,13 @@ func (v viewPort) Update(event tea.Msg) (tea.Model, tea.Cmd) {
 	return v, cmd
 }
 
-func initializeViewPort() viewPort {
-	v := viewPort{page: openLoginPage()}
+func initializeViewPort(client *whatsmeow.Client) viewPort {
+	v := viewPort{page: openLoginPage(client)}
 	return v
 }
 
-func StartUI(dbConn db.DBConn) {
-	p := tea.NewProgram(initializeViewPort())
+func StartUI(client *whatsmeow.Client) {
+	p := tea.NewProgram(initializeViewPort(client))
 
 	if _, err := p.Run(); err != nil {
 		panic(err)

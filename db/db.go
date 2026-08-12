@@ -12,8 +12,8 @@ import (
 
 
 type DBConn struct {
-	ctx context.Context
-	container *sqlstore.Container
+	Ctx context.Context
+	Container *sqlstore.Container
 }
 
 func New(log *slog.Logger, dbName string) (DBConn, io.Closer) {
@@ -26,8 +26,8 @@ func New(log *slog.Logger, dbName string) (DBConn, io.Closer) {
 	}
 
 	return DBConn{
-		container: container,
-		ctx: ctx,
+		Container: container,
+		Ctx: ctx,
 	}, container
 
 }

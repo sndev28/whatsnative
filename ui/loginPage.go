@@ -1,8 +1,13 @@
 package ui
 
 import (
-	"strings"
+	"context"
+	"fmt"
+	"log/slog"
+	"strings"	
+
 	"github.com/mdp/qrterminal/v3"
+	"go.mau.fi/whatsmeow"
 
 	tea "charm.land/bubbletea/v2"
 )
@@ -10,21 +15,66 @@ import (
 
 type LoginPage struct {
 	Page
-	loginQR string
+	qrChan <-chan whatsmeow.QRChannelItem
 }
 
 
-func openLoginPage() LoginPage {
-	return LoginPage{
-		loginQR: "El Psy Kongroo!", //placeholder
+func openLoginPage(client *whatsmeow.Client) LoginPage {
+
+	if client.Store.ID == nil {
+		// No ID stored, new login
+		qrChan, err := client.GetQRChannel(context.Background())
+
+		if err != nil {
+			slog.Error(err.Error())
+			panic(err)
+		}
+		
+		err = client.Connect()
+		if err != nil {
+			slog.Error(err.Error())
+			panic(err)
+		}
+
+		return LoginPage{
+			qrChan: qrChan,
+		}
+
+	} else {
+		// Already logged in, just connect
+		return LoginPage{
+			qrChan: nil,
+		}
 	}
+}
+
+func displayQRCode(code string, s *strings.Builder) {
+	qrterminal.GenerateHalfBlock(code, qrterminal.L, s)
+}
+
+func displayTimeout(s *strings.Builder) {
+	fmt.Fprint(s, "Log in attempt has timed out!")
 }
 
 
 
 func (l LoginPage) render() string {
 	s := strings.Builder{}
-	qrterminal.GenerateHalfBlock(l.loginQR, qrterminal.L, &s)
+
+	if l.qrChan != nil {
+		evt := <-l.qrChan 
+
+		switch evt.Event {
+			case "code":
+				displayQRCode(evt.Code, &s)
+			case "timeout":
+				displayTimeout(&s)
+		}
+	} else {
+		fmt.Fprint(&s, "Logged in!")
+	}
+
+	
 
 	return s.String();
 }

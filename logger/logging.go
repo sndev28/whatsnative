@@ -11,14 +11,17 @@ import (
 
 )
 
-func DbLogger () (*slog.Logger, io.Closer) {
-	file, err := os.OpenFile("dbLogs.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+func Logger (loggerName string, defaultLogger bool) (*slog.Logger, io.Closer) {
+	file, err := os.OpenFile(loggerName, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 	if err != nil {
 		log.Fatalf("Failed to open log file: %v", err)
 	}
 
-	dbLog := slog.New(slog.NewTextHandler(file, nil))
-	return dbLog, file
+	log := slog.New(slog.NewTextHandler(file, nil))
+	if (defaultLogger) {
+		slog.SetDefault(log)
+	}
+	return log, file
 }
 
 
