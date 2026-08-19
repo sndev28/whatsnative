@@ -6,7 +6,7 @@ import (
 
 type Page struct {
 	pageTitle string
-	content string
+	content   string
 }
 
 type PageInterface interface {
@@ -17,12 +17,12 @@ type PageInterface interface {
 func newPage() Page {
 	return Page{
 		pageTitle: "Start",
-		content: "Empty page",
+		content:   "Empty page",
 	}
 }
 
-func (p Page) render() (string) {
-	return p.content;
+func (p Page) render() string {
+	return p.content
 }
 
 func (p Page) action(event tea.Msg) (PageInterface, tea.Cmd) {

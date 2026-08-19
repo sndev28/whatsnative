@@ -40,3 +40,15 @@ Cargo.lock
 
 *.log
 *.db
+
+# SQLite writes these two alongside the database in WAL mode, which is what
+# lets the UI read while whatsmeow writes.
+*.db-shm
+*.db-wal
+
+# Cached media downloads
+media/
+
+# The compiled binary, which takes its name from the module. Anchored to the
+# repository root so a package of the same name would still be tracked.
+/whatsnative

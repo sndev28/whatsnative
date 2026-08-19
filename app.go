@@ -1,32 +1,33 @@
 package main
 
 import (
-	_ "github.com/mattn/go-sqlite3"
-
-	"whatsnative/ui"
 	"whatsnative/logger"
+	"whatsnative/ui"
 
-	"whatsnative/db"
 	clientFactory "whatsnative/client"
-
-
+	"whatsnative/db"
 )
 
 const DB_NAME string = "my_database.db"
 
-
 func main() {
 	_, logCloser := logger.Logger("logs.log", true)
 	defer logCloser.Close()
-	
+
 	dbLog, dbLogCloser := logger.Logger("db.log", false)
 	defer dbLogCloser.Close()
 
 	dbConn, dbCloser := db.New(dbLog, DB_NAME)
 	defer dbCloser.Close()
 
-	client := clientFactory.CreateClient(dbConn)
-	defer client.Disconnect()
+	session := clientFactory.CreateClient(dbConn)
+	defer session.Close()
 
-	ui.StartUI(client)
+	// Connect before the UI starts so the QR codes (or the reconnect) are
+	// already on their way by the time the first frame is drawn.
+	if err := session.Start(); err != nil {
+		panic(err)
+	}
+
+	ui.StartUI(session, dbConn.Messages)
 }
