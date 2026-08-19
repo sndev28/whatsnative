@@ -710,7 +710,7 @@ func (s *Session) onMessage(event *events.Message) {
 	// A revoke arrives as an ordinary message whose payload names the message
 	// being deleted, so it has to be peeled off before the normal path treats
 	// it as something to display.
-	if protocol := event.Message.GetProtocolMessage(); protocol.GetType() == waE2E.ProtocolMessage_REVOKE {
+	if protocol, ok := revokedBy(event.Message); ok {
 		s.onRevoke(event, protocol)
 		return
 	}

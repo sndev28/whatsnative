@@ -179,6 +179,19 @@ func buildContextInfo(replyTo db.Message) *waE2E.ContextInfo {
 	}
 }
 
+// revokedBy reports whether a message is a delete-for-everyone.
+//
+// The nil check is the whole point. ProtocolMessage_REVOKE is zero, and
+// GetType on a nil ProtocolMessage returns the zero value, so asking only
+// "is the type REVOKE?" is true of every ordinary message ever sent.
+func revokedBy(m *waE2E.Message) (*waE2E.ProtocolMessage, bool) {
+	protocol := m.GetProtocolMessage()
+	if protocol == nil {
+		return nil, false
+	}
+	return protocol, protocol.GetType() == waE2E.ProtocolMessage_REVOKE
+}
+
 // forwardable rebuilds a stored message as something we can send on, flagged
 // as a forward so the recipient sees it as one.
 func forwardable(message db.Message) (*waE2E.Message, error) {

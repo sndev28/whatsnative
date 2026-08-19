@@ -843,11 +843,32 @@ func (s *MessageStore) Chats(kinds ...string) ([]Chat, error) {
 
 	rows, err := s.conn.Query(
 		`SELECT c.jid,
-		        COALESCE(NULLIF(c.name, ''), NULLIF(ct.name, ''), c.jid),
+		        COALESCE(
+		            -- A group or channel has a title of its own.
+		            NULLIF(c.name, ''),
+		            -- Then the address book, under either of the person's
+		            -- two addresses.
+		            NULLIF(ct.name, ''),
+		            NULLIF(ac.name, ''),
+		            -- Then what they call themselves, marked as unsaved the
+		            -- same way the transcript marks it.
+		            NULLIF((SELECT '~' || m.push_name FROM messages m
+		                    WHERE m.chat_jid = c.jid AND m.from_me = 0
+		                      AND m.push_name <> ''
+		                    ORDER BY m.timestamp DESC LIMIT 1), ''),
+		            -- Failing all that, a phone number reads better than a
+		            -- LID, which is meaningless to a person.
+		            CASE WHEN c.jid LIKE '%@s.whatsapp.net'
+		                 THEN '+' || substr(c.jid, 1, instr(c.jid, '@') - 1) END,
+		            CASE WHEN a.alt LIKE '%@s.whatsapp.net'
+		                 THEN '+' || substr(a.alt, 1, instr(a.alt, '@') - 1) END,
+		            c.jid),
 		        c.kind, c.is_group, c.last_message, c.last_active,
 		        c.pinned, c.muted, c.unread
 		 FROM chats c
 		 LEFT JOIN contacts ct ON ct.jid = c.jid
+		 LEFT JOIN aliases  a  ON a.jid  = c.jid
+		 LEFT JOIN contacts ac ON ac.jid = a.alt
 		 WHERE c.last_active > 0 AND c.kind IN (`+placeholders+`)
 		 ORDER BY c.pinned DESC, c.last_active DESC`,
 		arguments...,

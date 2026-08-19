@@ -1710,3 +1710,89 @@ func TestFilePickerGoesUp(t *testing.T) {
 		t.Errorf("went up to %q, want %q", got, dir)
 	}
 }
+
+// --- names in the rail ---------------------------------------------------
+
+// The rail used to fall straight from "no saved contact" to the raw JID, which
+// meant a chat with someone unsaved showed as 132354500739299@lid.
+func TestRailNamesUnsavedContacts(t *testing.T) {
+	store := streamsStore(t)
+
+	const (
+		lidChat = "132354500739299@lid"
+		pnChat  = "919876543210@s.whatsapp.net"
+	)
+
+	send := func(jid, pushName string, minute int) {
+		t.Helper()
+		if err := store.SaveMessage(db.Message{
+			ID: jid + string(rune('a'+minute)), ChatJID: jid, SenderJID: jid,
+			PushName: pushName, Content: "El Psy Kongroo!",
+			Timestamp: time.Date(2026, time.August, 19, 12, minute, 0, 0, time.UTC),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	send(lidChat, "Okabe", 1)
+	send(pnChat, "", 2)
+
+	nameOf := func(jid string) string {
+		t.Helper()
+		chats, err := store.Chats(tabChats.kinds()...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, chat := range chats {
+			if chat.JID == jid {
+				return chat.Name
+			}
+		}
+		t.Fatalf("chat %s missing", jid)
+		return ""
+	}
+
+	// Somebody unsaved is shown by the name they chose, tilde-marked.
+	if got := nameOf(lidChat); got != "~Okabe" {
+		t.Errorf("LID chat is named %q, want %q", got, "~Okabe")
+	}
+
+	// With no push name either, a phone number still beats a raw JID.
+	if got := nameOf(pnChat); got != "+919876543210" {
+		t.Errorf("phone chat is named %q, want the number", got)
+	}
+
+	// A LID with nothing at all falls back to the paired phone number.
+	if err := store.LinkJIDPairs([][2]string{{lidChat, pnChat}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveContacts(map[string]string{pnChat: "Kurisu"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MirrorNamesAcrossAliases(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Once it is a saved contact, the saved name wins over the push name.
+	if got := nameOf(lidChat); got != "Kurisu" {
+		t.Errorf("LID chat is named %q, want the saved contact name", got)
+	}
+}
+
+// A group keeps its own title rather than being named after a member.
+func TestRailKeepsGroupTitles(t *testing.T) {
+	store := streamsStore(t)
+
+	if err := store.SaveChatName(groupJID, "Future Gadget Lab", true); err != nil {
+		t.Fatal(err)
+	}
+	chats, err := store.Chats(tabChats.kinds()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, chat := range chats {
+		if chat.JID == groupJID && chat.Name != "Future Gadget Lab" {
+			t.Errorf("group is named %q", chat.Name)
+		}
+	}
+}
