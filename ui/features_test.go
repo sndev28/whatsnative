@@ -510,6 +510,213 @@ func TestPollsRender(t *testing.T) {
 	}
 }
 
+// Scrolling the rail must not open anything. Opening every chat on the way
+// past marks them all read on the phone and pulls a transcript each time.
+func TestScrollingTheRailDoesNotOpenChats(t *testing.T) {
+	page := fixturePage(t, 96, 24)
+	opened, _ := page.openChat(0)
+	page = opened.(ConversationsPage)
+
+	was := page.openJID
+	if was == "" {
+		t.Fatal("nothing open to begin with")
+	}
+
+	// Keyboard.
+	moved, cmd := page.handleKey(tea.KeyPressMsg{Code: tea.KeyDown})
+	page = moved.(ConversationsPage)
+	if page.cursor != 1 {
+		t.Errorf("down left the highlight at %d, want 1", page.cursor)
+	}
+	if page.openJID != was {
+		t.Errorf("scrolling changed the open chat to %s", page.openJID)
+	}
+	if cmd != nil {
+		t.Error("scrolling should not fetch anything")
+	}
+
+	// Wheel over the rail.
+	l := computeLayout(page.app.width, page.app.height, false)
+	wheeled, wheelCmd := page.handleWheel(tea.Mouse{X: 2, Y: l.chatTop, Button: tea.MouseWheelDown})
+	page = wheeled.(ConversationsPage)
+	if page.openJID != was {
+		t.Errorf("the wheel changed the open chat to %s", page.openJID)
+	}
+	if wheelCmd != nil {
+		t.Error("the wheel should not fetch anything")
+	}
+}
+
+// Enter is how the highlighted chat actually gets opened, now that moving on
+// to it no longer does.
+func TestEnterOpensTheHighlightedChat(t *testing.T) {
+	page := fixturePage(t, 96, 24)
+	opened, _ := page.openChat(0)
+	page = opened.(ConversationsPage)
+
+	first := page.openJID
+	moved, _ := page.handleKey(tea.KeyPressMsg{Code: tea.KeyDown})
+	page = moved.(ConversationsPage)
+
+	wanted := page.visible()[page.cursor].JID
+	entered, cmd := page.handleKey(tea.KeyPressMsg{Code: tea.KeyEnter})
+	page = entered.(ConversationsPage)
+
+	if page.openJID == first {
+		t.Error("enter did not open the highlighted chat")
+	}
+	if page.openJID != wanted {
+		t.Errorf("opened %s, want %s", page.openJID, wanted)
+	}
+	if cmd == nil {
+		t.Error("opening a chat should load its messages")
+	}
+}
+
+// But only when there is nothing to send: enter with text in the box still
+// sends it, so replying does not need a detour through tab.
+func TestEnterStillSendsWhenSomethingIsTyped(t *testing.T) {
+	page := fixturePage(t, 96, 24)
+	opened, _ := page.openChat(0)
+	page = opened.(ConversationsPage)
+
+	was := page.openJID
+	moved, _ := page.handleKey(tea.KeyPressMsg{Code: tea.KeyDown})
+	page = moved.(ConversationsPage)
+
+	for _, r := range "hello" {
+		typed, _ := page.handleKey(tea.KeyPressMsg{Text: string(r), Code: r})
+		page = typed.(ConversationsPage)
+	}
+
+	entered, _ := page.handleKey(tea.KeyPressMsg{Code: tea.KeyEnter})
+	page = entered.(ConversationsPage)
+	if page.openJID != was {
+		t.Errorf("enter with text typed opened %s instead of sending", page.openJID)
+	}
+}
+
+// The rail reorders whenever a message lands. The highlight has to follow the
+// conversation it was on -- not the row number, which now holds something
+// else, and not the open chat, which would yank it back from wherever the user
+// had scrolled to.
+func TestHighlightFollowsItsOwnChatAcrossAReorder(t *testing.T) {
+	page := fixturePage(t, 96, 24)
+	opened, _ := page.openChat(0)
+	page = opened.(ConversationsPage)
+
+	moved, _ := page.handleKey(tea.KeyPressMsg{Code: tea.KeyDown})
+	page = moved.(ConversationsPage)
+
+	under := page.visible()[page.cursor].JID
+	openWas := page.openJID
+	if under == openWas {
+		t.Fatal("this test needs the highlight somewhere other than the open chat")
+	}
+
+	// A message arrives elsewhere and the list comes back in a new order.
+	reordered := make([]db.Chat, len(page.chats))
+	copy(reordered, page.chats)
+	for i, j := 0, len(reordered)-1; i < j; i, j = i+1, j-1 {
+		reordered[i], reordered[j] = reordered[j], reordered[i]
+	}
+
+	next, _ := page.action(chatsLoadedMsg{chats: reordered})
+	page = next.(ConversationsPage)
+
+	if got := page.visible()[page.cursor].JID; got != under {
+		t.Errorf("the highlight slid to %s, want it to stay on %s", got, under)
+	}
+	if page.openJID != openWas {
+		t.Errorf("the open chat changed to %s", page.openJID)
+	}
+}
+
+// A chat entry is four rows -- name, preview, a blank and a separator -- and
+// all four are part of the thing you are clicking on.
+//
+// The row the highlight happens to be on is the one that matters here: it used
+// to be skipped as "already open", which was true only while scrolling opened
+// chats. The wheel drags the highlight to whatever you are scrolling past, so
+// that left the chat under the pointer as the one click could not open.
+func TestEveryRowOfAChatEntryOpensIt(t *testing.T) {
+	store := fixtureStore(t)
+	page := openConversationsPage(&app{messages: store, width: 200, height: 50})
+	for i := range 12 {
+		page.chats = append(page.chats, db.Chat{
+			JID:  fmt.Sprintf("%d@s.whatsapp.net", i),
+			Name: fmt.Sprintf("Chat %d", i),
+			Kind: db.KindChat,
+		})
+	}
+	page.openJID = page.chats[0].JID
+
+	l := computeLayout(200, 50, false)
+	const target = 7
+	want := page.chats[target].JID
+
+	for row, part := range []string{"name", "preview", "blank", "separator"} {
+		fresh := page
+		// The highlight sitting on the very chat being clicked is the case
+		// that used to fail.
+		fresh.cursor = target
+
+		y := l.chatTop + target*chatEntryRows + row
+		next, cmd := fresh.handleClick(tea.Mouse{X: 2, Y: y, Button: tea.MouseLeft})
+		got := next.(ConversationsPage)
+
+		if got.openJID != want {
+			t.Errorf("clicking the %s row (y=%d) opened %q, want %q", part, y, got.openJID, want)
+		}
+		if cmd == nil {
+			t.Errorf("clicking the %s row did not load the conversation", part)
+		}
+	}
+}
+
+// Clicking the chat already on screen should not refetch it, but it should
+// still move the highlight there.
+func TestClickingTheOpenChatMovesTheHighlightWithoutReloading(t *testing.T) {
+	page := fixturePage(t, 96, 24)
+	opened, _ := page.openChat(0)
+	page = opened.(ConversationsPage)
+
+	// Highlight parked somewhere else, as if scrolled away and back.
+	page.cursor = 1
+
+	l := computeLayout(page.app.width, page.app.height, false)
+	next, cmd := page.handleClick(tea.Mouse{X: 2, Y: l.chatTop, Button: tea.MouseLeft})
+	got := next.(ConversationsPage)
+
+	if cmd != nil {
+		t.Error("the open chat was fetched again")
+	}
+	if got.cursor != 0 {
+		t.Errorf("highlight is at %d, want it moved to the clicked row", got.cursor)
+	}
+}
+
+// Now that the highlight and the open conversation can sit on different rows,
+// a reader has to be able to tell which is which.
+func TestRailShowsHighlightAndOpenChatApart(t *testing.T) {
+	page := fixturePage(t, 96, 24)
+	chat := page.chats[0]
+
+	plainRow, _ := page.chatEntry(chat, false, false, 30)
+	cursorRow, _ := page.chatEntry(chat, true, false, 30)
+	openRow, _ := page.chatEntry(chat, false, true, 30)
+
+	if cursorRow == plainRow {
+		t.Error("the highlighted row looks identical to an ordinary one")
+	}
+	if openRow == plainRow {
+		t.Error("the open chat looks identical to one that is not open")
+	}
+	if cursorRow == openRow {
+		t.Error("the highlight and the open chat are indistinguishable")
+	}
+}
+
 // The picker offers nine slots and fills them from what has actually been
 // used, falling back to the defaults for whatever is left over.
 func TestPaletteMergesHistoryOverDefaults(t *testing.T) {

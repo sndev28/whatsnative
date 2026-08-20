@@ -467,6 +467,16 @@ func (c ConversationsPage) selectedChat() (db.Chat, bool) {
 }
 
 // rowOf is where a chat sits in the rail as currently filtered, or -1.
+// cursorJID is the conversation the highlight is on, which is not necessarily
+// the one that is open.
+func (c ConversationsPage) cursorJID() string {
+	chats := c.visible()
+	if c.cursor < 0 || c.cursor >= len(chats) {
+		return ""
+	}
+	return chats[c.cursor].JID
+}
+
 func (c ConversationsPage) rowOf(jid string) int {
 	for i, chat := range c.visible() {
 		if chat.JID == jid {
@@ -534,7 +544,7 @@ func (c ConversationsPage) railLines(l layout) []string {
 	first := c.firstChat(l.visibleChats())
 
 	for i := first; i < len(chats) && len(lines) < l.contentRows; i++ {
-		name, preview := c.chatEntry(chats[i], i == c.cursor, width)
+		name, preview := c.chatEntry(chats[i], i == c.cursor, chats[i].JID == c.openJID, width)
 		// Every entry is the same height, blank line and divider included, so
 		// a click can be turned back into a chat by simple division.
 		lines = append(lines, name, preview, cell("", width), rule(width))
@@ -567,17 +577,24 @@ func (c ConversationsPage) tabStrip(width int) string {
 	return " " + strings.Join(parts, "  ")
 }
 
-func (c ConversationsPage) chatEntry(chat db.Chat, selected bool, width int) (string, string) {
+func (c ConversationsPage) chatEntry(chat db.Chat, underCursor, open bool, width int) (string, string) {
 	stamp := chat.LastActive.Format("15:04")
 	if time.Since(chat.LastActive) > 24*time.Hour {
 		stamp = chat.LastActive.Format("02 Jan")
 	}
 
-	// The marker is always two cells: a bar for the open chat, a caret for a
-	// pinned one, and both together when they coincide.
+	// The marker is always two cells: a bar where the highlight is, a caret for
+	// a pinned chat, and both together when they coincide.
+	//
+	// The highlight and the open conversation are separate now that scrolling
+	// no longer opens anything, so they need telling apart: the bar moves with
+	// the arrows, and the open chat is the one with the bright name.
 	bar, pin, style := " ", " ", titleStyle
-	if selected {
-		bar, style = accentStyle.Render("▌"), nameStyle
+	if underCursor {
+		bar = accentStyle.Render("▌")
+	}
+	if open {
+		style = nameStyle
 	}
 	if chat.Pinned {
 		pin = accentStyle.Render("^")
@@ -984,10 +1001,15 @@ func (c ConversationsPage) action(event tea.Msg) (PageInterface, tea.Cmd) {
 			c.fail("error: " + msg.err.Error())
 			return c, nil
 		}
+		// Which conversation the highlight is on, read before the list is
+		// replaced underneath it. The rail reorders whenever a message lands,
+		// so following the row number would slide the highlight onto whatever
+		// has since moved into that position -- and following the open chat
+		// instead would yank it away from wherever the user had scrolled to.
+		under := c.cursorJID()
+
 		c.chats = msg.chats
-		// Follow the open conversation to wherever it has moved, rather than
-		// leaving the highlight on a row that now holds a different chat.
-		if row := c.rowOf(c.openJID); row >= 0 {
+		if row := c.rowOf(under); row >= 0 {
 			c.cursor = row
 		} else {
 			c.cursor = min(c.cursor, max(len(c.visible())-1, 0))
@@ -1293,6 +1315,12 @@ func (c ConversationsPage) handleKey(key tea.KeyPressMsg) (PageInterface, tea.Cm
 		return c, openMedia(c.app, message)
 
 	case "enter":
+		// On the rail with nothing typed, enter opens the highlighted chat.
+		// With something in the box it still sends, so replying never needs a
+		// detour through tab.
+		if c.focus == focusChats && c.input.empty() {
+			return c.openChat(c.cursor)
+		}
 		return c.submit()
 	}
 
@@ -1601,13 +1629,14 @@ func (c ConversationsPage) selectTab(next tabKind) (PageInterface, tea.Cmd) {
 	return c, loadChats(c.app, next.kinds()...)
 }
 
-// moveCursor changes the open chat and loads its messages.
+// moveCursor moves the rail highlight, and nothing else.
+//
+// It deliberately does not open anything: scrolling past a conversation is not
+// a request to read it, and opening each one in turn marks them read on the
+// phone and drags a transcript down the wire. Enter or a click opens.
 func (c ConversationsPage) moveCursor(delta int) (PageInterface, tea.Cmd) {
-	next := min(max(c.cursor+delta, 0), max(len(c.visible())-1, 0))
-	if next == c.cursor {
-		return c, nil
-	}
-	return c.openChat(next)
+	c.cursor = min(max(c.cursor+delta, 0), max(len(c.visible())-1, 0))
+	return c, nil
 }
 
 func (c ConversationsPage) openChat(index int) (PageInterface, tea.Cmd) {
@@ -1669,7 +1698,12 @@ func (c ConversationsPage) handleClick(mouse tea.Mouse) (PageInterface, tea.Cmd)
 		}
 
 		c.focus = focusChats
-		if index == c.cursor {
+		// Skipping the reload when the chat is already on screen is worth
+		// doing; skipping it when the *highlight* is merely sitting there is
+		// not. The two used to be the same row, and testing the wrong one left
+		// whichever chat you had just scrolled to unclickable.
+		if c.visible()[index].JID == c.openJID {
+			c.cursor = index
 			return c, nil
 		}
 		return c.openChat(index)
