@@ -234,6 +234,14 @@ CREATE TABLE IF NOT EXISTS reactions (
 );
 
 CREATE INDEX IF NOT EXISTS reactions_by_chat ON reactions (chat_jid, message_id);
+
+-- How often we have reacted with each emoji, so the picker can put the ones
+-- actually used at the front instead of a fixed list somebody guessed at.
+CREATE TABLE IF NOT EXISTS emoji_uses (
+	emoji     TEXT PRIMARY KEY,
+	uses      INTEGER NOT NULL DEFAULT 0,
+	last_used INTEGER NOT NULL DEFAULT 0
+);
 `
 
 // addedColumns are applied on top of the base schema, per table.
@@ -1083,6 +1091,60 @@ func (s *MessageStore) SetReadThrough(jid string, through time.Time) error {
 		return fmt.Errorf("set read through: %w", err)
 	}
 	return nil
+}
+
+// RecordEmojiUse counts one more reaction sent with this emoji.
+//
+// Only our own choices are counted. What other people react with says nothing
+// about which keys this user wants under their fingers.
+func (s *MessageStore) RecordEmojiUse(emoji string) error {
+	if emoji == "" {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.conn.Exec(
+		`INSERT INTO emoji_uses (emoji, uses, last_used)
+		 VALUES (?, 1, ?)
+		 ON CONFLICT (emoji) DO UPDATE SET
+		     uses      = emoji_uses.uses + 1,
+		     last_used = excluded.last_used`,
+		emoji, time.Now().Unix(),
+	)
+	if err != nil {
+		return fmt.Errorf("record emoji use: %w", err)
+	}
+	return nil
+}
+
+// TopEmoji returns the most-used emoji, commonest first.
+//
+// Ties break on recency, so of two emoji used equally often the one reached
+// for most recently sits higher.
+func (s *MessageStore) TopEmoji(limit int) ([]string, error) {
+	rows, err := s.conn.Query(
+		`SELECT emoji FROM emoji_uses
+		  WHERE uses > 0
+		  ORDER BY uses DESC, last_used DESC, emoji
+		  LIMIT ?`,
+		limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("top emoji: %w", err)
+	}
+	defer rows.Close()
+
+	var emoji []string
+	for rows.Next() {
+		var one string
+		if err := rows.Scan(&one); err != nil {
+			return nil, fmt.Errorf("scan emoji: %w", err)
+		}
+		emoji = append(emoji, one)
+	}
+	return emoji, rows.Err()
 }
 
 // statusRank orders the delivery states so a receipt can only move a message

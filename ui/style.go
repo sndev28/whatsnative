@@ -97,6 +97,20 @@ func cell(s string, width int) string {
 	return s
 }
 
+// graphemeCount counts user-perceived characters rather than runes.
+//
+// An emoji is routinely several runes -- a heart carries a variation selector,
+// a thumbs-up may carry a skin tone, a family is joined by zero-width joiners
+// -- and all of those are one character to the person who typed them.
+func graphemeCount(s string) int {
+	count := 0
+	graphemes := uniseg.NewGraphemes(s)
+	for graphemes.Next() {
+		count++
+	}
+	return count
+}
+
 // blanks builds n empty lines of the given width.
 func blanks(n, width int) []string {
 	lines := make([]string, 0, max(n, 0))

@@ -93,8 +93,38 @@ const (
 	focusMessages
 )
 
-// reactionPalette is the quick-pick list, chosen with the number keys.
-var reactionPalette = []string{"👍", "❤️", "😂", "😮", "😢", "🙏"}
+// paletteSize is how many emoji the quick-pick offers. Nine, because that is
+// how many number keys there are before 0, which opens the custom box.
+const paletteSize = 9
+
+// defaultPalette seeds the picker before anything has been used, and backfills
+// it afterwards so there are always nine slots to aim at.
+var defaultPalette = []string{"👍", "❤️", "😂", "😮", "😢", "🙏", "🔥", "🎉", "💯"}
+
+// palette merges the emoji actually used into the defaults, commonest first.
+//
+// History alone would leave a short list on a new install and a list that
+// shrinks nothing on an old one, so the defaults fill whatever is left. An
+// emoji reached for through the custom box arrives here like any other: the
+// only thing that decides order is how often it was chosen.
+func palette(history []string) []string {
+	out := make([]string, 0, paletteSize)
+	seen := make(map[string]bool, paletteSize)
+
+	for _, group := range [][]string{history, defaultPalette} {
+		for _, emoji := range group {
+			if len(out) == paletteSize {
+				return out
+			}
+			if emoji == "" || seen[emoji] {
+				continue
+			}
+			seen[emoji] = true
+			out = append(out, emoji)
+		}
+	}
+	return out
+}
 
 // transcriptLine is one rendered row and the message it belongs to, so a mouse
 // click on that row can be traced back to a message. Separators own nothing
@@ -125,6 +155,16 @@ type ConversationsPage struct {
 	focus    paneFocus
 	replyTo  db.Message
 	reacting bool
+
+	// reactCustom is the second stage of the picker: anything outside the
+	// palette, typed or pasted.
+	reactCustom bool
+	reactInput  textInput
+
+	// reactPalette is the quick-pick list, refreshed after each reaction is
+	// sent. Held rather than recomputed on every render so the keys cannot
+	// shuffle under the user's fingers while the picker is open.
+	reactPalette []string
 
 	// filtering routes typing to the chat search rather than the message box.
 	filtering bool
@@ -162,6 +202,9 @@ func openConversationsPage(a *app) ConversationsPage {
 		selected:       -1,
 		lastClickOwner: -1,
 		status:         "Loading conversations…",
+		// Defaults until the stored history arrives, so the picker is never
+		// empty even on the first frame.
+		reactPalette: palette(nil),
 	}
 }
 
@@ -192,6 +235,8 @@ type (
 	reactionSentMsg struct{ err error }
 
 	receiptSentMsg struct{ err error }
+
+	paletteLoadedMsg struct{ emoji []string }
 )
 
 // loadChats reads the conversation list in a command rather than inside
@@ -319,7 +364,26 @@ func sendReaction(a *app, chatJID string, target db.Message, emoji string) tea.C
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
-		return reactionSentMsg{err: a.session.SendReaction(ctx, chatJID, target, emoji)}
+		if err := a.session.SendReaction(ctx, chatJID, target, emoji); err != nil {
+			return reactionSentMsg{err: err}
+		}
+		// Counted only once WhatsApp has taken it, so a failed send does not
+		// promote an emoji up the picker.
+		if err := a.messages.RecordEmojiUse(emoji); err != nil {
+			slog.Warn("could not record emoji use", "emoji", emoji, "error", err)
+		}
+		return reactionSentMsg{}
+	}
+}
+
+// loadPalette reads the quick-pick list back out of the usage history.
+func loadPalette(a *app) tea.Cmd {
+	return func() tea.Msg {
+		history, err := a.messages.TopEmoji(paletteSize)
+		if err != nil {
+			slog.Warn("could not read emoji history", "error", err)
+		}
+		return paletteLoadedMsg{emoji: palette(history)}
 	}
 }
 
@@ -857,11 +921,20 @@ func reactionSummary(reactions []db.Reaction) string {
 }
 
 func (c ConversationsPage) statusLine(l layout) string {
+	if c.reactCustom {
+		prompt := " " + titleStyle.Render("react") + " "
+		// The input gets whatever is left once the prompt and hint are down.
+		hint := mutedStyle.Render("   enter sends · esc back")
+		room := l.width - layoutWidth(prompt) - layoutWidth(hint)
+		return cell(prompt+c.reactInput.render(room)+hint, l.width)
+	}
+
 	if c.reacting {
-		parts := make([]string, 0, len(reactionPalette))
-		for i, emoji := range reactionPalette {
+		parts := make([]string, 0, len(c.reactPalette)+1)
+		for i, emoji := range c.reactPalette {
 			parts = append(parts, fmt.Sprintf("%s %s", titleStyle.Render(fmt.Sprint(i+1)), reactionLabel(emoji)))
 		}
+		parts = append(parts, titleStyle.Render("0")+" any")
 		return cell(" "+strings.Join(parts, "   ")+mutedStyle.Render("    esc cancels"), l.width)
 	}
 
@@ -978,7 +1051,15 @@ func (c ConversationsPage) action(event tea.Msg) (PageInterface, tea.Cmd) {
 			return c, nil
 		}
 		c.note("")
-		return c, c.reload()
+		// The picker is closed by now, so re-reading the history here cannot
+		// shuffle the keys under a hand that is mid-press.
+		return c, tea.Batch(c.reload(), loadPalette(c.app))
+
+	case paletteLoadedMsg:
+		if len(msg.emoji) > 0 {
+			c.reactPalette = msg.emoji
+		}
+		return c, nil
 
 	case receiptSentMsg:
 		// Not worth a banner over the conversation the user is reading: the
@@ -1289,12 +1370,33 @@ func (c ConversationsPage) commitForward(index int) (PageInterface, tea.Cmd) {
 
 func (c ConversationsPage) handleReactionKey(key tea.KeyPressMsg) (PageInterface, tea.Cmd) {
 	name := key.String()
-	if name == "esc" {
-		c.reacting = false
+
+	// Second stage: a free-text box, so any emoji at all can be sent and not
+	// just the six on the palette.
+	if c.reactCustom {
+		switch name {
+		case "esc":
+			// Back to the palette rather than out altogether, so a mistyped
+			// character does not cost the whole picker.
+			c.reactCustom, c.reactInput = false, c.reactInput.clear()
+			return c, nil
+		case "enter":
+			return c.sendCustomReaction()
+		}
+		c.reactInput = c.reactInput.update(key)
 		return c, nil
 	}
 
-	for i, emoji := range reactionPalette {
+	switch name {
+	case "esc":
+		c.reacting = false
+		return c, nil
+	case "0":
+		c.reactCustom, c.reactInput = true, c.reactInput.clear()
+		return c, nil
+	}
+
+	for i, emoji := range c.reactPalette {
 		if name != fmt.Sprint(i+1) {
 			continue
 		}
@@ -1311,6 +1413,34 @@ func (c ConversationsPage) handleReactionKey(key tea.KeyPressMsg) (PageInterface
 	return c, nil
 }
 
+// sendCustomReaction validates whatever was typed and sends it.
+//
+// WhatsApp's model is one emoji per person per message, so anything longer is
+// refused here rather than sent and silently dropped by the server.
+func (c ConversationsPage) sendCustomReaction() (PageInterface, tea.Cmd) {
+	emoji := strings.TrimSpace(c.reactInput.string())
+	if emoji == "" {
+		c.reactCustom, c.reacting = false, false
+		return c, nil
+	}
+	if graphemeCount(emoji) != 1 {
+		c.fail("One emoji at a time — that is " + fmt.Sprint(graphemeCount(emoji)))
+		return c, nil
+	}
+
+	message, ok := c.selectedMessage()
+	chat, chatOK := c.selectedChat()
+	if !ok || !chatOK {
+		c.reactCustom, c.reacting = false, false
+		return c, nil
+	}
+
+	c.reactCustom, c.reacting = false, false
+	c.reactInput = c.reactInput.clear()
+	c.note("Reacting " + emoji + "…")
+	return c, sendReaction(c.app, chat.JID, message, emoji)
+}
+
 // handlePaste deals with pasted text, and with files dropped onto the window:
 // terminals deliver a drop as a bracketed paste of the path.
 func (c ConversationsPage) handlePaste(content string) (PageInterface, tea.Cmd) {
@@ -1323,6 +1453,12 @@ func (c ConversationsPage) handlePaste(content string) (PageInterface, tea.Cmd) 
 	// Ordinary paste: type it into whichever box has the keyboard.
 	for _, r := range content {
 		key := tea.KeyPressMsg{Text: string(r), Code: r}
+		if c.reactCustom {
+			// Pasting is how an emoji realistically gets in from a picker,
+			// so the reaction box has to accept one too.
+			c.reactInput = c.reactInput.update(key)
+			continue
+		}
 		if c.filtering {
 			c.filter = c.filter.update(key)
 			continue

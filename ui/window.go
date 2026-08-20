@@ -26,7 +26,9 @@ type viewPort struct {
 }
 
 func (v viewPort) Init() tea.Cmd {
-	return loadChats(v.app)
+	// The emoji history is read once here; after that the picker refreshes
+	// itself each time a reaction goes out.
+	return tea.Batch(loadChats(v.app), loadPalette(v.app))
 }
 
 func (v viewPort) View() tea.View {

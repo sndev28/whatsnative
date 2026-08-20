@@ -510,6 +510,242 @@ func TestPollsRender(t *testing.T) {
 	}
 }
 
+// The picker offers nine slots and fills them from what has actually been
+// used, falling back to the defaults for whatever is left over.
+func TestPaletteMergesHistoryOverDefaults(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		history []string
+		want    []string // only the leading entries that must be exact
+	}{
+		{
+			name: "nothing used yet falls back to the defaults",
+			want: defaultPalette,
+		},
+		{
+			name:    "a used emoji outranks every default",
+			history: []string{"🥳"},
+			want:    []string{"🥳", "👍", "❤️"},
+		},
+		{
+			name:    "history order is kept",
+			history: []string{"😢", "🔥", "👍"},
+			want:    []string{"😢", "🔥", "👍", "❤️"},
+		},
+		{
+			name:    "a default already in history is not repeated",
+			history: []string{"👍"},
+			want:    []string{"👍", "❤️", "😂"},
+		},
+	} {
+		got := palette(tc.history)
+
+		if len(got) != paletteSize {
+			t.Errorf("%s: palette has %d entries, want %d", tc.name, len(got), paletteSize)
+		}
+		for i, want := range tc.want {
+			if i < len(got) && got[i] != want {
+				t.Errorf("%s: slot %d is %q, want %q", tc.name, i+1, got[i], want)
+			}
+		}
+
+		seen := map[string]bool{}
+		for _, emoji := range got {
+			if seen[emoji] {
+				t.Errorf("%s: %q appears twice", tc.name, emoji)
+			}
+			seen[emoji] = true
+		}
+	}
+}
+
+// More history than there are slots must not overflow the number keys.
+func TestPaletteNeverExceedsTheNumberKeys(t *testing.T) {
+	history := []string{"1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟", "🅰️"}
+
+	got := palette(history)
+	if len(got) != paletteSize {
+		t.Fatalf("palette has %d entries, want %d", len(got), paletteSize)
+	}
+	if got[len(got)-1] != "9️⃣" {
+		t.Errorf("last slot is %q, want the ninth most-used", got[len(got)-1])
+	}
+}
+
+// The whole point: an emoji reached for through the custom box is counted like
+// any other and climbs into the quick-pick.
+func TestUsedEmojiClimbTheQuickPick(t *testing.T) {
+	store := fixtureStore(t)
+
+	// A custom one used often, and a default used once.
+	const custom = "🫠"
+	for range 3 {
+		if err := store.RecordEmojiUse(custom); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.RecordEmojiUse("😂"); err != nil {
+		t.Fatal(err)
+	}
+
+	history, err := store.TopEmoji(paletteSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history) != 2 || history[0] != custom || history[1] != "😂" {
+		t.Fatalf("history is %v, want the custom one first", history)
+	}
+
+	got := palette(history)
+	if got[0] != custom {
+		t.Errorf("slot 1 is %q, want the most-used %q", got[0], custom)
+	}
+	if got[1] != "😂" {
+		t.Errorf("slot 2 is %q, want %q", got[1], "😂")
+	}
+	// And the defaults still fill the rest rather than leaving gaps.
+	if len(got) != paletteSize {
+		t.Errorf("palette has %d entries, want %d", len(got), paletteSize)
+	}
+}
+
+// Two emoji used equally often are ordered by which was reached for last.
+func TestEqualUseBreaksTiesOnRecency(t *testing.T) {
+	store := fixtureStore(t)
+
+	for _, emoji := range []string{"🐢", "🐇"} {
+		if err := store.RecordEmojiUse(emoji); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Both were used once, in the same second. Setting the timestamps apart
+	// tests the ordering itself rather than making the test sleep for it.
+	if err := store.Exec(`UPDATE emoji_uses SET last_used = 100 WHERE emoji = '🐢'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Exec(`UPDATE emoji_uses SET last_used = 200 WHERE emoji = '🐇'`); err != nil {
+		t.Fatal(err)
+	}
+
+	history, err := store.TopEmoji(paletteSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history) != 2 || history[0] != "🐇" {
+		t.Errorf("history is %v, want the more recent one first", history)
+	}
+}
+
+// The palette is six emoji; anything else has to be reachable or most of the
+// keyboard's worth of reactions is simply unavailable.
+func TestCustomReactionAcceptsAnyEmoji(t *testing.T) {
+	page := fixturePage(t, 96, 24)
+	page.selected = len(page.messages) - 1
+	page.reacting = true
+
+	press := func(p ConversationsPage, key tea.KeyPressMsg) ConversationsPage {
+		t.Helper()
+		next, _ := p.handleKey(key)
+		return next.(ConversationsPage)
+	}
+
+	// "0" opens the custom slot without leaving the picker.
+	page = press(page, tea.KeyPressMsg{Text: "0", Code: '0'})
+	if !page.reactCustom {
+		t.Fatal("0 did not open the custom reaction box")
+	}
+	if !page.reacting {
+		t.Error("opening the custom box should stay inside the picker")
+	}
+
+	// A skin-toned thumbs-up: four runes, one character. Typed as a paste,
+	// which is how one realistically arrives from a system emoji picker.
+	const thumb = "👍🏽"
+	pasted, _ := page.handlePaste(thumb)
+	page = pasted.(ConversationsPage)
+	if got := page.reactInput.string(); got != thumb {
+		t.Fatalf("reaction box holds %q, want %q", got, thumb)
+	}
+
+	sent, cmd := page.handleKey(tea.KeyPressMsg{Code: tea.KeyEnter})
+	page = sent.(ConversationsPage)
+	if cmd == nil {
+		t.Error("enter did not produce a send command")
+	}
+	if page.reacting || page.reactCustom {
+		t.Error("the picker should close once the reaction is away")
+	}
+	if !strings.Contains(page.status, thumb) {
+		t.Errorf("status is %q, want it to name the emoji sent", page.status)
+	}
+}
+
+// WhatsApp allows one emoji per person per message, so a longer string is
+// refused here rather than sent and quietly dropped by the server.
+func TestCustomReactionRefusesMoreThanOneCharacter(t *testing.T) {
+	page := fixturePage(t, 96, 24)
+	page.selected = len(page.messages) - 1
+	page.reacting, page.reactCustom = true, true
+
+	typed, _ := page.handlePaste("😂😂")
+	page = typed.(ConversationsPage)
+
+	sent, cmd := page.handleKey(tea.KeyPressMsg{Code: tea.KeyEnter})
+	page = sent.(ConversationsPage)
+	if cmd != nil {
+		t.Error("two emoji should not have been sent")
+	}
+	if !page.failed {
+		t.Error("refusing should say so rather than silently doing nothing")
+	}
+	if !page.reactCustom {
+		t.Error("the box should stay open so the mistake can be corrected")
+	}
+}
+
+// Multi-rune emoji are one character: a heart carries a variation selector, a
+// family is joined by zero-width joiners. Counting runes would reject them all.
+func TestGraphemeCountTreatsEmojiAsOneCharacter(t *testing.T) {
+	for _, tc := range []struct {
+		text string
+		want int
+	}{
+		{"😂", 1},
+		{"❤️", 1},   // heart + variation selector
+		{"👍🏽", 1},   // thumbs-up + skin tone
+		{"👨‍👩‍👧", 1}, // joined family
+		{"😂😂", 2},
+		{"", 0},
+	} {
+		if got := graphemeCount(tc.text); got != tc.want {
+			t.Errorf("graphemeCount(%q) = %d, want %d", tc.text, got, tc.want)
+		}
+	}
+}
+
+// Escape out of the custom box goes back to the palette rather than closing
+// the picker, so one mistyped character does not cost the whole thing.
+func TestEscapeFromCustomReactionReturnsToPalette(t *testing.T) {
+	page := fixturePage(t, 96, 24)
+	page.selected = len(page.messages) - 1
+	page.reacting, page.reactCustom = true, true
+
+	typed, _ := page.handlePaste("x")
+	page = typed.(ConversationsPage)
+
+	backed, _ := page.handleKey(tea.KeyPressMsg{Code: tea.KeyEscape})
+	page = backed.(ConversationsPage)
+	if page.reactCustom {
+		t.Error("escape should leave the custom box")
+	}
+	if !page.reacting {
+		t.Error("escape from the custom box should return to the palette")
+	}
+	if !page.reactInput.empty() {
+		t.Error("the abandoned text should not be waiting next time")
+	}
+}
+
 // View-once media is kept like anything else, so the reader has to be told
 // which it is: the sender believes it is already gone.
 func TestViewOnceIsLabelled(t *testing.T) {
