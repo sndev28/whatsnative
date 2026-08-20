@@ -24,11 +24,58 @@ func (c content) empty() bool {
 	return c.Text == "" && c.Media.Kind == db.MediaNone && c.Poll.Question == ""
 }
 
+// maxUnwrapDepth bounds the peeling in unwrap. Two layers is normal -- a
+// view-once photo in a disappearing chat -- and nothing legitimate goes deep.
+const maxUnwrapDepth = 8
+
+// unwrap peels the containers WhatsApp puts a real message inside, and reports
+// whether any of them was a view-once envelope.
+//
+// A view-once photo does not arrive as a Message with an ImageMessage on it:
+// it arrives as a Message whose only populated field holds another Message,
+// and the photo is in there. Nothing at the top level is set, so without this
+// the message describes as empty and is dropped on the floor. Disappearing
+// messages and documents-with-captions are wrapped the same way.
+func unwrap(m *waE2E.Message) (payload *waE2E.Message, viewOnce bool) {
+	for range maxUnwrapDepth {
+		var inner *waE2E.Message
+		switch {
+		case m.GetViewOnceMessage() != nil:
+			inner, viewOnce = m.GetViewOnceMessage().GetMessage(), true
+		case m.GetViewOnceMessageV2() != nil:
+			inner, viewOnce = m.GetViewOnceMessageV2().GetMessage(), true
+		case m.GetViewOnceMessageV2Extension() != nil:
+			inner, viewOnce = m.GetViewOnceMessageV2Extension().GetMessage(), true
+		case m.GetEphemeralMessage() != nil:
+			inner = m.GetEphemeralMessage().GetMessage()
+		case m.GetDocumentWithCaptionMessage() != nil:
+			inner = m.GetDocumentWithCaptionMessage().GetMessage()
+		case m.GetGroupMentionedMessage() != nil:
+			inner = m.GetGroupMentionedMessage().GetMessage()
+		case m.GetLottieStickerMessage() != nil:
+			inner = m.GetLottieStickerMessage().GetMessage()
+		}
+		if inner == nil {
+			return m, viewOnce
+		}
+		m = inner
+	}
+	return m, viewOnce
+}
+
 // describe walks a protobuf message. Everything WhatsApp can send arrives as
 // one big oneof-style struct where exactly one field is set, so this is a walk
 // through the kinds we handle.
 func describe(m *waE2E.Message) content {
+	// Unwrapping here rather than at the call sites means history sync, quoted
+	// replies and thumbnail backfill all get it too, and none of them can be
+	// forgotten later.
+	m, viewOnce := unwrap(m)
+
 	text, media, reply := describeParts(m)
+	if media.Kind != db.MediaNone {
+		media.ViewOnce = viewOnce
+	}
 	return content{Text: text, Media: media, Reply: reply, Poll: describePoll(m)}
 }
 

@@ -32,6 +32,10 @@ func (v viewPort) Init() tea.Cmd {
 func (v viewPort) View() tea.View {
 	view := tea.NewView(v.page.render())
 	view.AltScreen = true
+	// Name the window ourselves rather than leaving it as whatever the
+	// terminal called itself. This reaches any terminal, however it was
+	// launched, and it is what the title bar and window list read.
+	view.WindowTitle = "WhatsApp"
 	// Cell motion reports clicks, releases and the wheel, which is everything
 	// the conversation page needs and nothing more; all-motion would flood the
 	// update loop with a message per pixel of cursor movement.

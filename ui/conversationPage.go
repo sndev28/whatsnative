@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	neturl "net/url"
 	"os"
 	"path/filepath"
@@ -189,6 +190,8 @@ type (
 	mediaOpenedMsg struct{ err error }
 
 	reactionSentMsg struct{ err error }
+
+	receiptSentMsg struct{ err error }
 )
 
 // loadChats reads the conversation list in a command rather than inside
@@ -202,13 +205,35 @@ func loadChats(a *app, kinds ...string) tea.Cmd {
 
 // markRead clears a chat's unread count and reloads the list, which is what
 // opening a conversation should do.
+//
+// The receipt WhatsApp needs travels separately, in sendReceipt: clearing the
+// badge is local and instant, and it should not wait on the network.
 func markRead(a *app, chatJID string, kinds []string) tea.Cmd {
+	return tea.Batch(
+		func() tea.Msg {
+			if err := a.messages.MarkRead(chatJID); err != nil {
+				return chatsLoadedMsg{err: err}
+			}
+			chats, err := a.messages.Chats(kinds...)
+			return chatsLoadedMsg{chats: chats, err: err}
+		},
+		sendReceipt(a, chatJID),
+	)
+}
+
+// sendReceipt tells WhatsApp the chat has been seen, so the phone drops its
+// own badge and the sender gets blue ticks.
+func sendReceipt(a *app, chatJID string) tea.Cmd {
+	// The layout tests drive a page against the store alone, with nothing
+	// connected behind it.
+	if a.session == nil {
+		return nil
+	}
 	return func() tea.Msg {
-		if err := a.messages.MarkRead(chatJID); err != nil {
-			return chatsLoadedMsg{err: err}
-		}
-		chats, err := a.messages.Chats(kinds...)
-		return chatsLoadedMsg{chats: chats, err: err}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		return receiptSentMsg{err: a.session.MarkRead(ctx, chatJID)}
 	}
 }
 
@@ -668,6 +693,12 @@ func (c ConversationsPage) messageLines(message db.Message, index, width int, sh
 	if chip != "" {
 		add(indent + mutedStyle.Render(truncate(chip, body)))
 	}
+	// A picture drawn inline carries no chip, so the marker would be lost with
+	// it -- and this is the one case where the reader most needs telling, since
+	// the sender believes nobody can still see this.
+	if len(picture) > 0 && message.Media.ViewOnce {
+		add(indent + reactStyle.Render(truncate("[view once]", body)))
+	}
 	for _, row := range picture {
 		add(row)
 	}
@@ -757,16 +788,23 @@ func (c ConversationsPage) pictureRows(message db.Message, indent string, body i
 }
 
 func mediaChip(media db.Media) string {
+	// View-once media goes in the chip's own brackets rather than beside them,
+	// so it reads as what the thing is and cannot be mistaken for a filename.
+	once := ""
+	if media.ViewOnce {
+		once = "view once "
+	}
+
 	label := "attachment"
 	switch media.Kind {
 	case db.MediaImage:
-		label = "[photo]"
+		label = "[" + once + "photo]"
 	case db.MediaSticker:
 		label = "[sticker]"
 	case db.MediaVideo:
-		label = "[video]"
+		label = "[" + once + "video]"
 	case db.MediaAudio:
-		label = "[" + orDefault(plain(media.Name), "audio") + "]"
+		label = "[" + once + orDefault(plain(media.Name), "audio") + "]"
 	case db.MediaDocument:
 		label = "[doc] " + orDefault(plain(media.Name), "document")
 	}
@@ -927,6 +965,11 @@ func (c ConversationsPage) action(event tea.Msg) (PageInterface, tea.Cmd) {
 			return c, nil
 		}
 		c.note("")
+		// Answering a chat means you read it. Without this the phone keeps its
+		// badge and draws its unread line above our own reply.
+		if chat, ok := c.selectedChat(); ok {
+			return c, tea.Batch(c.reload(), sendReceipt(c.app, chat.JID))
+		}
 		return c, c.reload()
 
 	case reactionSentMsg:
@@ -936,6 +979,14 @@ func (c ConversationsPage) action(event tea.Msg) (PageInterface, tea.Cmd) {
 		}
 		c.note("")
 		return c, c.reload()
+
+	case receiptSentMsg:
+		// Not worth a banner over the conversation the user is reading: the
+		// receipt is retried the next time the chat is opened.
+		if msg.err != nil {
+			slog.Warn("could not send read receipt", "error", msg.err)
+		}
+		return c, nil
 
 	case client.NewMessage:
 		chat, ok := c.selectedChat()

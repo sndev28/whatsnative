@@ -147,3 +147,116 @@ func TestPlainMessageSurvivesTheRevokeCheck(t *testing.T) {
 		t.Errorf("described as %+v", described)
 	}
 }
+
+// A view-once photo arrives inside an envelope: nothing is set at the top
+// level, so before it was unwrapped it described as empty and never reached
+// the chat at all.
+func TestViewOnceMediaIsUnwrapped(t *testing.T) {
+	photo := &waE2E.ImageMessage{
+		Mimetype:      proto.String("image/jpeg"),
+		Caption:       proto.String("only once"),
+		FileLength:    proto.Uint64(4096),
+		JPEGThumbnail: []byte("pretend jpeg"),
+	}
+	clip := &waE2E.VideoMessage{
+		Mimetype:   proto.String("video/mp4"),
+		FileLength: proto.Uint64(8192),
+	}
+
+	for _, tc := range []struct {
+		name         string
+		message      *waE2E.Message
+		wantKind     string
+		wantText     string
+		wantViewOnce bool
+	}{
+		{
+			name:         "view once v1",
+			message:      &waE2E.Message{ViewOnceMessage: wrapped(&waE2E.Message{ImageMessage: photo})},
+			wantKind:     db.MediaImage,
+			wantText:     "only once",
+			wantViewOnce: true,
+		},
+		{
+			name:         "view once v2",
+			message:      &waE2E.Message{ViewOnceMessageV2: wrapped(&waE2E.Message{ImageMessage: photo})},
+			wantKind:     db.MediaImage,
+			wantText:     "only once",
+			wantViewOnce: true,
+		},
+		{
+			name:         "view once v2 extension",
+			message:      &waE2E.Message{ViewOnceMessageV2Extension: wrapped(&waE2E.Message{VideoMessage: clip})},
+			wantKind:     db.MediaVideo,
+			wantViewOnce: true,
+		},
+		{
+			// Disappearing is not view-once, and must not be labelled as it.
+			name:     "disappearing",
+			message:  &waE2E.Message{EphemeralMessage: wrapped(&waE2E.Message{VideoMessage: clip})},
+			wantKind: db.MediaVideo,
+		},
+		{
+			// Disappearing and view-once at once, which is a real combination.
+			name: "view once inside a disappearing chat",
+			message: &waE2E.Message{EphemeralMessage: wrapped(&waE2E.Message{
+				ViewOnceMessageV2: wrapped(&waE2E.Message{ImageMessage: photo}),
+			})},
+			wantKind:     db.MediaImage,
+			wantText:     "only once",
+			wantViewOnce: true,
+		},
+	} {
+		described := describe(tc.message)
+		if described.empty() {
+			t.Errorf("%s: described as empty, so it would never be stored", tc.name)
+			continue
+		}
+		if described.Media.Kind != tc.wantKind {
+			t.Errorf("%s: kind is %q, want %q", tc.name, described.Media.Kind, tc.wantKind)
+		}
+		if described.Text != tc.wantText {
+			t.Errorf("%s: text is %q, want %q", tc.name, described.Text, tc.wantText)
+		}
+		if described.Media.ViewOnce != tc.wantViewOnce {
+			t.Errorf("%s: view once is %v, want %v", tc.name, described.Media.ViewOnce, tc.wantViewOnce)
+		}
+
+		// DownloadAny only looks at a message's top level, so what we store has
+		// to be the unwrapped one or the attachment could never be fetched.
+		var stored waE2E.Message
+		if err := proto.Unmarshal(described.Media.Proto, &stored); err != nil {
+			t.Fatalf("%s: stored proto does not parse: %v", tc.name, err)
+		}
+		if stored.GetImageMessage() == nil && stored.GetVideoMessage() == nil {
+			t.Errorf("%s: stored proto is still wrapped, so it cannot be downloaded", tc.name)
+		}
+	}
+}
+
+// Unwrapping must not turn an ordinary message into something else, and must
+// not loop on an envelope holding nothing.
+func TestUnwrapLeavesOrdinaryMessagesAlone(t *testing.T) {
+	plain := &waE2E.Message{Conversation: proto.String("El Psy Kongroo")}
+	if got, viewOnce := unwrap(plain); got != plain || viewOnce {
+		t.Error("a plain message should come back untouched and unmarked")
+	}
+	if got, viewOnce := unwrap(nil); got != nil || viewOnce {
+		t.Error("nil should stay nil")
+	}
+	empty := &waE2E.Message{ViewOnceMessageV2: &waE2E.FutureProofMessage{}}
+	if got, _ := unwrap(empty); got != empty {
+		t.Error("an empty envelope has nothing inside, so it is its own payload")
+	}
+
+	// A disappearing message is not a view-once one; only the reader who has
+	// both straight can trust either label.
+	clip := &waE2E.Message{VideoMessage: &waE2E.VideoMessage{Mimetype: proto.String("video/mp4")}}
+	if _, viewOnce := unwrap(&waE2E.Message{EphemeralMessage: wrapped(clip)}); viewOnce {
+		t.Error("a disappearing message was marked view once")
+	}
+}
+
+func wrapped(m *waE2E.Message) *waE2E.FutureProofMessage {
+	return &waE2E.FutureProofMessage{Message: m}
+}

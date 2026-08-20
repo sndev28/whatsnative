@@ -172,6 +172,180 @@ func TestUnreadCountsAndClearing(t *testing.T) {
 	}
 }
 
+// Clearing the local badge is not the same as telling WhatsApp: the messages
+// still owing a receipt are tracked separately, and only what we sent stops
+// coming back.
+func TestUnackedIncomingTracksWhatStillOwesAReceipt(t *testing.T) {
+	store := fixtureStore(t)
+
+	pending, err := store.UnackedIncoming(daruJID, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Newest first, and never our own messages: "a" is from us.
+	var ids []string
+	for _, message := range pending {
+		ids = append(ids, message.ID)
+	}
+	if got, want := strings.Join(ids, ","), "d,b"; got != want {
+		t.Fatalf("pending = %q, want %q", got, want)
+	}
+
+	// Clearing the badge alone must not retire them; only the receipt does.
+	if err := store.MarkRead(daruJID); err != nil {
+		t.Fatal(err)
+	}
+	if pending, err := store.UnackedIncoming(daruJID, 100); err != nil {
+		t.Fatal(err)
+	} else if len(pending) != 2 {
+		t.Errorf("clearing the badge retired %d messages, want 0", 2-len(pending))
+	}
+
+	if err := store.SetReadThrough(daruJID, pending[0].Timestamp); err != nil {
+		t.Fatal(err)
+	}
+	if pending, err := store.UnackedIncoming(daruJID, 100); err != nil {
+		t.Fatal(err)
+	} else if len(pending) != 0 {
+		t.Errorf("%d messages still pending after the receipt, want 0", len(pending))
+	}
+
+	// A message that arrives afterwards owes a receipt of its own.
+	later := db.Message{
+		ID: "e", ChatJID: daruJID, SenderJID: daruJID, Sender: "Daru",
+		Content: "you there?", Timestamp: pending[0].Timestamp.Add(time.Hour),
+	}
+	if err := store.SaveMessage(later); err != nil {
+		t.Fatal(err)
+	}
+	if pending, err := store.UnackedIncoming(daruJID, 100); err != nil {
+		t.Fatal(err)
+	} else if len(pending) != 1 || pending[0].ID != "e" {
+		t.Errorf("pending after a new message = %v, want just e", pending)
+	}
+}
+
+// History sync backfills older messages, so the mark must never slide back and
+// re-acknowledge a conversation that has already been read.
+func TestReadThroughOnlyMovesForward(t *testing.T) {
+	store := fixtureStore(t)
+
+	newest := time.Date(2026, time.August, 12, 14, 32, 0, 0, time.UTC)
+	if err := store.SetReadThrough(daruJID, newest); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetReadThrough(daruJID, newest.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	pending, err := store.UnackedIncoming(daruJID, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 0 {
+		t.Errorf("an older mark reopened %d messages, want 0", len(pending))
+	}
+}
+
+// A tag arrives as a bare @<number>, and it is usually a LID rather than a
+// phone number, so the name has to be found through the alias table.
+func TestMentionsResolveToNames(t *testing.T) {
+	store := fixtureStore(t)
+
+	// Invented addresses, in the shape WhatsApp actually uses: a LID is a long
+	// run of digits, and the same person is reachable at a phone number too.
+	const (
+		daruLID   = "10000000000001@lid"
+		ownLID    = "10000000000002@lid"
+		ownPhone  = "919876543210@s.whatsapp.net"
+		strangeID = "10000000000003"
+	)
+	if err := store.LinkJIDs(daruLID, daruJID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MirrorNamesAcrossAliases(); err != nil {
+		t.Fatal(err)
+	}
+	store.Identify("Rintaro Okabe", ownPhone, ownLID)
+
+	sent := time.Date(2026, time.August, 12, 15, 0, 0, 0, time.UTC)
+	tagged := db.Message{
+		ID: "m1", ChatJID: groupJID, SenderJID: daruJID, Sender: "Daru",
+		Content:   "@" + strings.TrimSuffix(daruLID, "@lid") + " @" + strings.TrimSuffix(ownLID, "@lid") + " @" + strangeID + " who is coming",
+		Timestamp: sent, IsGroup: true,
+	}
+	if err := store.SaveMessage(tagged); err != nil {
+		t.Fatal(err)
+	}
+
+	messages, err := store.Messages(groupJID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got string
+	for _, message := range messages {
+		if message.ID == "m1" {
+			got = message.Content
+		}
+	}
+
+	want := "@Daru @Rintaro Okabe @" + strangeID + " who is coming"
+	if got != want {
+		t.Errorf("mentions resolved to\n  %q\nwant\n  %q", got, want)
+	}
+}
+
+// Nothing that merely looks like a tag should be rewritten, and a number
+// nobody answers to has to survive untouched rather than become a wrong name.
+func TestUnknownMentionsAreLeftAlone(t *testing.T) {
+	store := fixtureStore(t)
+
+	sent := time.Date(2026, time.August, 12, 15, 0, 0, 0, time.UTC)
+	original := "ring @911 or ext @4021 about invoice @99887766554433"
+	if err := store.SaveMessage(db.Message{
+		ID: "m2", ChatJID: groupJID, SenderJID: daruJID,
+		Content: original, Timestamp: sent, IsGroup: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	messages, err := store.Messages(groupJID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, message := range messages {
+		if message.ID == "m2" && message.Content != original {
+			t.Errorf("text was rewritten to %q, want %q", message.Content, original)
+		}
+	}
+}
+
+// A handle that already starts with an @ would otherwise render as "@@handle".
+func TestSelfMentionDoesNotDoubleTheAt(t *testing.T) {
+	store := fixtureStore(t)
+	store.Identify("@hououin_kyouma", "10000000000002@lid")
+
+	sent := time.Date(2026, time.August, 12, 15, 0, 0, 0, time.UTC)
+	if err := store.SaveMessage(db.Message{
+		ID: "m3", ChatJID: groupJID, SenderJID: daruJID,
+		Content: "oi @10000000000002", Timestamp: sent, IsGroup: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	messages, err := store.Messages(groupJID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, message := range messages {
+		if message.ID == "m3" && message.Content != "oi @hououin_kyouma" {
+			t.Errorf("content is %q, want %q", message.Content, "oi @hououin_kyouma")
+		}
+	}
+}
+
 // Receipts arrive out of order, so a delivery report must never undo a read.
 func TestDeliveryStatusOnlyMovesForward(t *testing.T) {
 	store := fixtureStore(t)
@@ -333,6 +507,102 @@ func TestPollsRender(t *testing.T) {
 		if !strings.Contains(rendered, want) {
 			t.Errorf("transcript is missing %q", want)
 		}
+	}
+}
+
+// View-once media is kept like anything else, so the reader has to be told
+// which it is: the sender believes it is already gone.
+func TestViewOnceIsLabelled(t *testing.T) {
+	store := streamsStore(t)
+
+	sent := time.Date(2026, time.August, 12, 20, 0, 0, 0, time.UTC)
+	if err := store.SaveMessage(db.Message{
+		ID: "vo1", ChatJID: groupJID, SenderJID: daruJID, PushName: "Daru", IsGroup: true,
+		Timestamp: sent,
+		Media:     db.Media{Kind: db.MediaImage, Mime: "image/jpeg", Size: 1000, ViewOnce: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// An ordinary photo alongside it, so a label that is simply always on would
+	// not pass.
+	if err := store.SaveMessage(db.Message{
+		ID: "ord1", ChatJID: groupJID, SenderJID: daruJID, PushName: "Daru", IsGroup: true,
+		Timestamp: sent.Add(time.Minute),
+		Media:     db.Media{Kind: db.MediaImage, Mime: "image/jpeg", Size: 1000},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	messages, err := store.Messages(groupJID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	byID := map[string]db.Message{}
+	for _, message := range messages {
+		byID[message.ID] = message
+	}
+	if !byID["vo1"].Media.ViewOnce {
+		t.Error("the view-once flag did not survive the round trip")
+	}
+	if byID["ord1"].Media.ViewOnce {
+		t.Error("an ordinary photo came back marked view once")
+	}
+
+	// The chip is what shows while there is no picture to draw.
+	if got := mediaChip(byID["vo1"].Media); !strings.Contains(got, "[view once photo]") {
+		t.Errorf("chip is %q, want it to say view once", got)
+	}
+	if got := mediaChip(byID["ord1"].Media); strings.Contains(got, "view once") {
+		t.Errorf("ordinary photo chip is %q", got)
+	}
+
+	// And the rail preview, where the whole message is one line.
+	if got := byID["vo1"].Preview(); got != "[view once photo]" {
+		t.Errorf("preview is %q, want %q", got, "[view once photo]")
+	}
+
+	page := openConversationsPage(&app{messages: store, width: 96, height: 24})
+	page.messages = []db.Message{byID["vo1"]}
+	page.chats = []db.Chat{{JID: groupJID, Name: "Lab", Kind: db.KindGroup, IsGroup: true}}
+
+	rendered := ""
+	for _, line := range page.transcript(60) {
+		rendered += stripANSIForTest.ReplaceAllString(line.text, "") + "\n"
+	}
+	if !strings.Contains(rendered, "view once") {
+		t.Errorf("transcript does not say view once:\n%s", rendered)
+	}
+}
+
+// When the picture draws inline there is no chip to carry the marker, so it
+// has to be a line of its own or it vanishes exactly when it matters.
+func TestViewOnceIsLabelledOnADrawnPicture(t *testing.T) {
+	store := streamsStore(t)
+
+	page := openConversationsPage(&app{messages: store, width: 96, height: 24})
+	page.chats = []db.Chat{{JID: groupJID, Name: "Lab", Kind: db.KindGroup, IsGroup: true}}
+	page.messages = []db.Message{{
+		ID: "vo2", ChatJID: groupJID, SenderJID: daruJID, Sender: "Daru", IsGroup: true,
+		Timestamp: time.Date(2026, time.August, 12, 20, 0, 0, 0, time.UTC),
+		Media: db.Media{
+			Kind: db.MediaImage, Mime: "image/png", Size: 1000, ViewOnce: true,
+			Thumbnail: testPNG(t, 24, 24),
+		},
+	}}
+
+	var rendered, drew = "", false
+	for _, line := range page.transcript(60) {
+		rendered += stripANSIForTest.ReplaceAllString(line.text, "") + "\n"
+		if strings.Contains(line.text, "\x1b[") && strings.Contains(line.text, "▀") {
+			drew = true
+		}
+	}
+	if !drew {
+		t.Skip("the picture did not draw here, so there is no chipless case to check")
+	}
+	if !strings.Contains(rendered, "[view once]") {
+		t.Errorf("a drawn view-once picture lost its label:\n%s", rendered)
 	}
 }
 

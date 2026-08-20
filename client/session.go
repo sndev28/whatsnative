@@ -206,6 +206,70 @@ func (s *Session) Revoke(ctx context.Context, chatJID string, message db.Message
 	return s.messages.MarkRevoked(chatJID, message.ID)
 }
 
+// readReceiptLimit caps how far back one open will reach. Every chat starts
+// with its high-water mark at zero, so without a cap the first open after
+// upgrading would try to acknowledge the entire synced history.
+const readReceiptLimit = 100
+
+// MarkRead tells WhatsApp the chat has been seen. Clearing our own unread
+// count is a local matter; this is what moves the badge on the phone and turns
+// the sender's ticks blue.
+//
+// whatsmeow takes one receipt per sender, so the pending messages are grouped
+// before they go out: a busy group would otherwise need a node each.
+func (s *Session) MarkRead(ctx context.Context, chatJID string) error {
+	chat, err := types.ParseJID(chatJID)
+	if err != nil {
+		return fmt.Errorf("parse chat jid %q: %w", chatJID, err)
+	}
+
+	// Status posts are a special case worth leaving alone: a receipt there
+	// reports to the poster that you watched their status, and merely opening
+	// the tab is not that.
+	if kindForJID(chat) == db.KindStatus {
+		return nil
+	}
+
+	pending, err := s.messages.UnackedIncoming(chatJID, readReceiptLimit)
+	if err != nil || len(pending) == 0 {
+		return err
+	}
+
+	// Map iteration order is random and receipts are cheaper to reason about in
+	// a fixed order, so the senders are kept in the order they first appear.
+	var (
+		order    []types.JID
+		bySender = map[types.JID][]types.MessageID{}
+		newest   time.Time
+	)
+	for _, message := range pending {
+		sender, err := types.ParseJID(message.SenderJID)
+		if err != nil {
+			continue
+		}
+		sender = sender.ToNonAD()
+		if _, seen := bySender[sender]; !seen {
+			order = append(order, sender)
+		}
+		bySender[sender] = append(bySender[sender], types.MessageID(message.ID))
+		if message.Timestamp.After(newest) {
+			newest = message.Timestamp
+		}
+	}
+
+	// The timestamp is when we read, not when the message arrived.
+	now := time.Now()
+	for _, sender := range order {
+		if err := s.WA.MarkRead(ctx, bySender[sender], now, chat, sender); err != nil {
+			return fmt.Errorf("mark read: %w", err)
+		}
+	}
+
+	// Only after the server has taken them, so a failure part-way leaves the
+	// rest to be retried on the next open.
+	return s.messages.SetReadThrough(chatJID, newest)
+}
+
 // Forward sends an existing message on to another chat.
 //
 // Media is re-sent from the protobuf we stored rather than downloaded and
@@ -492,6 +556,7 @@ func (s *Session) onConnected() {
 	ctx, cancel := context.WithTimeout(s.ctx, 30*time.Second)
 	defer cancel()
 
+	s.identifySelf()
 	s.syncAddressBook(ctx)
 	s.refreshContacts(ctx)
 	s.refreshGroups(ctx)
@@ -499,6 +564,27 @@ func (s *Session) onConnected() {
 	s.refreshChatSettings(ctx)
 	s.backfillThumbnails()
 	s.emit(Connected{PushName: s.WA.Store.PushName})
+}
+
+// identifySelf tells the store our own addresses, so a message that tags us
+// shows a name.
+//
+// Both are needed: a group addresses its members by LID, a one-to-one chat by
+// phone number, and a mention carries whichever the sender's client used.
+func (s *Session) identifySelf() {
+	name := s.WA.Store.PushName
+	if name == "" {
+		return
+	}
+
+	var jids []string
+	if own := s.WA.Store.ID; own != nil {
+		jids = append(jids, own.ToNonAD().String())
+	}
+	if lid := s.WA.Store.LID; !lid.IsEmpty() {
+		jids = append(jids, lid.ToNonAD().String())
+	}
+	s.messages.Identify(name, jids...)
 }
 
 // syncAddressBook makes whatsmeow fetch the contact list.
@@ -699,10 +785,17 @@ func (s *Session) refreshChatSettings(ctx context.Context) {
 }
 
 func (s *Session) onMessage(event *events.Message) {
+	// Everything below reads one message, so the containers come off first:
+	// otherwise a view-once photo, or a revoke in a disappearing chat, is an
+	// envelope with nothing recognisable on it.
+	// describe unwraps again for itself, which is where the view-once flag is
+	// picked up; here it is only the payload that matters.
+	payload, _ := unwrap(event.Message)
+
 	// A reaction arrives as an ordinary message whose payload points at the
 	// message being reacted to, so it has to be peeled off before the normal
 	// path treats it as something to display.
-	if reaction := event.Message.GetReactionMessage(); reaction != nil {
+	if reaction := payload.GetReactionMessage(); reaction != nil {
 		s.onReaction(event, reaction)
 		return
 	}
@@ -710,7 +803,7 @@ func (s *Session) onMessage(event *events.Message) {
 	// A revoke arrives as an ordinary message whose payload names the message
 	// being deleted, so it has to be peeled off before the normal path treats
 	// it as something to display.
-	if protocol, ok := revokedBy(event.Message); ok {
+	if protocol, ok := revokedBy(payload); ok {
 		s.onRevoke(event, protocol)
 		return
 	}
@@ -720,7 +813,7 @@ func (s *Session) onMessage(event *events.Message) {
 	// learn the pairing, and it works even before contacts have been synced.
 	s.linkFromMessage(event)
 
-	described := describe(event.Message)
+	described := describe(payload)
 	if described.empty() {
 		// Receipts, protocol messages: nothing to show.
 		return

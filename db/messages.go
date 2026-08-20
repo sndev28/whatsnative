@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -59,6 +60,10 @@ type Media struct {
 	// itself. It needs no download, and it is the only way to show an
 	// animated sticker, whose webp no Go decoder will open.
 	Thumbnail []byte
+	// ViewOnce marks media the sender meant to be seen once. We keep it like
+	// anything else -- but the reader should know which it is, because the
+	// sender believes it is gone.
+	ViewOnce bool
 }
 
 // Reply is the quoted message shown above a reply.
@@ -146,6 +151,41 @@ type MessageStore struct {
 	// several statements inside SaveMessage from interleaving with a save
 	// running on one of whatsmeow's other goroutines.
 	mu sync.Mutex
+
+	// Who we are, for resolving a mention of ourselves. See Identify.
+	selfName string
+	selfJIDs map[string]bool
+}
+
+// Identify records our own addresses and what to call them.
+//
+// WhatsApp does keep a contact entry for you, but it holds whatever handle you
+// picked, which is not the name you think of yourself by -- and a mention of
+// yourself is the one a reader most wants to recognise. Kept out of the
+// contacts table on purpose: that table is replaced wholesale on every sync,
+// and its size decides whether a full address-book fetch is needed.
+func (s *MessageStore) Identify(name string, jids ...string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.selfName = name
+	s.selfJIDs = make(map[string]bool, len(jids))
+	for _, jid := range jids {
+		if jid != "" {
+			s.selfJIDs[jid] = true
+		}
+	}
+}
+
+// self returns the name to use for one of our own addresses, if it is one.
+func (s *MessageStore) self(jid string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.selfName == "" || !s.selfJIDs[jid] {
+		return "", false
+	}
+	return s.selfName, true
 }
 
 const messageSchema = `
@@ -218,6 +258,7 @@ var addedColumns = map[string][]struct{ name, definition string }{
 		{"poll_options", "TEXT NOT NULL DEFAULT ''"},
 		{"revoked", "INTEGER NOT NULL DEFAULT 0"},
 		{"media_thumb", "BLOB"},
+		{"media_view_once", "INTEGER NOT NULL DEFAULT 0"},
 	},
 	"chats": {
 		{"kind", "TEXT NOT NULL DEFAULT 'chat'"},
@@ -225,6 +266,7 @@ var addedColumns = map[string][]struct{ name, definition string }{
 		{"unread", "INTEGER NOT NULL DEFAULT 0"},
 		{"muted", "INTEGER NOT NULL DEFAULT 0"},
 		{"archived", "INTEGER NOT NULL DEFAULT 0"},
+		{"read_through", "INTEGER NOT NULL DEFAULT 0"},
 	},
 }
 
@@ -332,12 +374,12 @@ func (s *MessageStore) SaveMessage(m Message) error {
 		`INSERT OR IGNORE INTO messages
 		     (id, chat_jid, sender_jid, sender, content, timestamp, from_me,
 		      media_kind, media_mime, media_name, media_size, media_proto, media_path,
-		      media_thumb, reply_id, reply_sender, reply_text,
+		      media_thumb, media_view_once, reply_id, reply_sender, reply_text,
 		      push_name, status, poll_question, poll_options)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		m.ID, m.ChatJID, m.SenderJID, m.Sender, m.Content, m.Timestamp.Unix(), m.FromMe,
 		m.Media.Kind, m.Media.Mime, m.Media.Name, m.Media.Size, m.Media.Proto, m.Media.Path,
-		m.Media.Thumbnail,
+		m.Media.Thumbnail, m.Media.ViewOnce,
 		m.Reply.MessageID, m.Reply.Sender, m.Reply.Text,
 		m.PushName, m.Status, m.Poll.Question, encodeOptions(m.Poll.Options),
 	)
@@ -375,13 +417,21 @@ func (m Message) Preview() string {
 	if m.Content != "" {
 		return m.Content
 	}
+
+	// View-once media is worth naming as such even in a one-line preview: the
+	// sender expects it to be unrecoverable.
+	once := ""
+	if m.Media.ViewOnce {
+		once = "view once "
+	}
+
 	switch m.Media.Kind {
 	case MediaImage:
-		return "[photo]"
+		return "[" + once + "photo]"
 	case MediaVideo:
-		return "[video]"
+		return "[" + once + "video]"
 	case MediaAudio:
-		return "[audio]"
+		return "[" + once + "audio]"
 	case MediaSticker:
 		return "[sticker]"
 	case MediaDocument:
@@ -898,6 +948,15 @@ func (s *MessageStore) Chats(kinds ...string) ([]Chat, error) {
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate chats: %w", err)
 	}
+
+	// The rail previews the last message, mentions and all.
+	texts := make([]*string, 0, len(chats))
+	for i := range chats {
+		texts = append(texts, &chats[i].LastMessage)
+	}
+	if err := s.resolveMentions(texts); err != nil {
+		return nil, err
+	}
 	return chats, nil
 }
 
@@ -946,6 +1005,9 @@ func (s *MessageStore) BumpUnread(jid string) error {
 }
 
 // MarkRead clears a chat's unread count, when the user opens it.
+//
+// This is the local half only. WhatsApp learns nothing from it, so the phone
+// keeps its own badge until a receipt goes out: see Session.MarkRead.
 func (s *MessageStore) MarkRead(jid string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -953,6 +1015,72 @@ func (s *MessageStore) MarkRead(jid string) error {
 	_, err := s.conn.Exec(`UPDATE chats SET unread = 0 WHERE jid = ?`, jid)
 	if err != nil {
 		return fmt.Errorf("mark read: %w", err)
+	}
+	return nil
+}
+
+// Unacked is one incoming message that still owes WhatsApp a read receipt.
+type Unacked struct {
+	ID        string
+	SenderJID string
+	Timestamp time.Time
+}
+
+// UnackedIncoming returns the incoming messages in a chat that have arrived
+// since the last receipt went out, newest first and no more than limit of them.
+//
+// Read state is a position in the conversation rather than a set of messages,
+// so it is kept as a high-water mark on the chat. That also bounds the damage
+// on the first open after upgrading, when every chat's mark is still zero:
+// there is a cap on how far back we are willing to reach.
+func (s *MessageStore) UnackedIncoming(chatJID string, limit int) ([]Unacked, error) {
+	rows, err := s.conn.Query(
+		`SELECT m.id, m.sender_jid, m.timestamp
+		   FROM messages m
+		   JOIN chats c ON c.jid = m.chat_jid
+		  WHERE m.chat_jid = ? AND m.from_me = 0 AND m.revoked = 0
+		    AND m.timestamp > c.read_through
+		  ORDER BY m.timestamp DESC
+		  LIMIT ?`,
+		chatJID, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("unacked incoming: %w", err)
+	}
+	defer rows.Close()
+
+	var pending []Unacked
+	for rows.Next() {
+		var (
+			message   Unacked
+			timestamp int64
+		)
+		if err := rows.Scan(&message.ID, &message.SenderJID, &timestamp); err != nil {
+			return nil, fmt.Errorf("scan unacked: %w", err)
+		}
+		message.Timestamp = time.Unix(timestamp, 0)
+		pending = append(pending, message)
+	}
+	return pending, rows.Err()
+}
+
+// SetReadThrough moves a chat's read high-water mark forward. It never moves
+// back: receipts and history sync both arrive out of order.
+func (s *MessageStore) SetReadThrough(jid string, through time.Time) error {
+	if through.IsZero() {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	seconds := through.Unix()
+	_, err := s.conn.Exec(
+		`UPDATE chats SET read_through = ? WHERE jid = ? AND read_through < ?`,
+		seconds, jid, seconds,
+	)
+	if err != nil {
+		return fmt.Errorf("set read through: %w", err)
 	}
 	return nil
 }
@@ -1047,7 +1175,7 @@ func (s *MessageStore) Messages(chatJID string, limit int) ([]Message, error) {
 		        END,
 		        m.content, m.timestamp, m.from_me,
 		        m.media_kind, m.media_mime, m.media_name, m.media_size, m.media_proto, m.media_path,
-		        m.media_thumb,
+		        m.media_thumb, m.media_view_once,
 		        m.reply_id,
 		        CASE
 		            WHEN m.reply_sender = '' THEN ''
@@ -1096,6 +1224,7 @@ func (s *MessageStore) Messages(chatJID string, limit int) ([]Message, error) {
 			&message.Sender, &message.Content, &timestamp, &message.FromMe,
 			&message.Media.Kind, &message.Media.Mime, &message.Media.Name,
 			&message.Media.Size, &mediaBlob, &message.Media.Path, &thumbnail,
+			&message.Media.ViewOnce,
 			&message.Reply.MessageID, &message.Reply.Sender, &message.Reply.Text,
 			&message.PushName, &message.Status, &message.Poll.Question, &pollOptions,
 			&message.Revoked,
@@ -1118,10 +1247,120 @@ func (s *MessageStore) Messages(chatJID string, limit int) ([]Message, error) {
 		messages[i], messages[j] = messages[j], messages[i]
 	}
 
+	// Both the message and the quoted preview above it carry raw mentions.
+	texts := make([]*string, 0, len(messages)*2)
+	for i := range messages {
+		texts = append(texts, &messages[i].Content, &messages[i].Reply.Text)
+	}
+	if err := s.resolveMentions(texts); err != nil {
+		return nil, err
+	}
+
 	if err := s.attachReactions(chatJID, messages); err != nil {
 		return nil, err
 	}
 	return messages, nil
+}
+
+// mentionPattern matches the @<number> WhatsApp leaves in the text when
+// somebody is tagged. The number is the address's user part -- a phone number,
+// or more often now a LID -- which is not something anyone can read.
+//
+// The five-digit floor keeps it off ordinary text like "@12"; anything that
+// does not resolve to a real name is left alone anyway.
+var mentionPattern = regexp.MustCompile(`@(\d{5,})`)
+
+// resolveMentions rewrites @<number> as @<name> in every text it is given.
+//
+// Done on the way out rather than at receive time, for the same reason sender
+// names are: the address book fills in later, and a message stored before a
+// contact was saved should still read correctly today.
+func (s *MessageStore) resolveMentions(texts []*string) error {
+	// Collect first. Most messages mention nobody, so this usually ends here
+	// without touching the database at all.
+	numbers := map[string]bool{}
+	for _, text := range texts {
+		for _, match := range mentionPattern.FindAllStringSubmatch(*text, -1) {
+			numbers[match[1]] = true
+		}
+	}
+	if len(numbers) == 0 {
+		return nil
+	}
+
+	names, err := s.namesForMentions(numbers)
+	if err != nil || len(names) == 0 {
+		return err
+	}
+
+	for _, text := range texts {
+		*text = mentionPattern.ReplaceAllStringFunc(*text, func(mention string) string {
+			name, ok := names[mention[len("@"):]]
+			if !ok {
+				// Nobody we know. Leave the number rather than invent a name.
+				return mention
+			}
+			// Handles often start with one of their own, and "@@handle" reads
+			// like a typo.
+			return "@" + strings.TrimPrefix(name, "@")
+		})
+	}
+	return nil
+}
+
+// namesForMentions resolves bare JID user parts to display names.
+//
+// A mention carries only the number, so both addresses the same person can be
+// reached at are tried, and the alias table covers a name saved against the
+// other one.
+func (s *MessageStore) namesForMentions(numbers map[string]bool) (map[string]string, error) {
+	names := make(map[string]string, len(numbers))
+
+	var (
+		wanted     []any
+		candidates = make([]string, 0, len(numbers)*2)
+	)
+	for number := range numbers {
+		for _, jid := range []string{number + "@s.whatsapp.net", number + "@lid"} {
+			if name, ok := s.self(jid); ok {
+				names[number] = name
+				continue
+			}
+			candidates = append(candidates, jid)
+			wanted = append(wanted, jid)
+		}
+	}
+	if len(candidates) == 0 {
+		return names, nil
+	}
+
+	rows, err := s.conn.Query(
+		`WITH wanted(jid) AS (VALUES `+
+			strings.TrimSuffix(strings.Repeat("(?),", len(candidates)), ",")+`)
+		 SELECT w.jid, COALESCE(NULLIF(c.name, ''), NULLIF(ac.name, ''), '')
+		   FROM wanted w
+		   LEFT JOIN contacts c  ON c.jid  = w.jid
+		   LEFT JOIN aliases  a  ON a.jid  = w.jid
+		   LEFT JOIN contacts ac ON ac.jid = a.alt`,
+		wanted...,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("resolve mentions: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var jid, name string
+		if err := rows.Scan(&jid, &name); err != nil {
+			return nil, fmt.Errorf("scan mention: %w", err)
+		}
+		number, _, _ := strings.Cut(jid, "@")
+		// Whichever address answers first wins; a person only has one name.
+		if name != "" && names[number] == "" {
+			names[number] = name
+		}
+	}
+	return names, rows.Err()
 }
 
 // attachReactions fills in Reactions on each message with one query, rather
@@ -1169,7 +1408,8 @@ func (s *MessageStore) attachReactions(chatJID string, messages []Message) error
 func (s *MessageStore) Message(chatJID, messageID string) (Message, bool, error) {
 	row := s.conn.QueryRow(
 		`SELECT id, chat_jid, sender_jid, sender, content, timestamp, from_me,
-		        media_kind, media_mime, media_name, media_size, media_path
+		        media_kind, media_mime, media_name, media_size, media_path,
+		        media_view_once
 		 FROM messages WHERE chat_jid = ? AND id = ?`,
 		chatJID, messageID,
 	)
@@ -1182,7 +1422,7 @@ func (s *MessageStore) Message(chatJID, messageID string) (Message, bool, error)
 		&message.ID, &message.ChatJID, &message.SenderJID,
 		&message.Sender, &message.Content, &timestamp, &message.FromMe,
 		&message.Media.Kind, &message.Media.Mime, &message.Media.Name,
-		&message.Media.Size, &message.Media.Path,
+		&message.Media.Size, &message.Media.Path, &message.Media.ViewOnce,
 	)
 	if err == sql.ErrNoRows {
 		return Message{}, false, nil
