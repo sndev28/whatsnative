@@ -26,3 +26,10 @@ jobs:
 
     - name: Test
       run: go test -v ./...
+
+    - name: Upload Binary to GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: ./whatsnative
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
