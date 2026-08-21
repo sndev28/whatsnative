@@ -237,6 +237,8 @@ type (
 	receiptSentMsg struct{ err error }
 
 	paletteLoadedMsg struct{ emoji []string }
+
+	copiedMsg struct{ err error }
 )
 
 // loadChats reads the conversation list in a command rather than inside
@@ -978,7 +980,7 @@ func (c ConversationsPage) statusLine(l layout) string {
 		return cell(" "+accentStyle.Render("Browsing files · enter opens · backspace up · esc cancels"), l.width)
 	}
 
-	help := "ctrl+f find · ctrl+u send file · dbl-click reply · ctrl+e react · ctrl+d delete · ctrl+w forward"
+	help := "ctrl+f find · ctrl+u send file · dbl-click reply · ctrl+e react · ctrl+y copy · ctrl+o open · ctrl+d delete · ctrl+w forward"
 	return cell(" "+mutedStyle.Render(truncate(help, l.width-2)), l.width)
 }
 
@@ -1081,6 +1083,14 @@ func (c ConversationsPage) action(event tea.Msg) (PageInterface, tea.Cmd) {
 		if len(msg.emoji) > 0 {
 			c.reactPalette = msg.emoji
 		}
+		return c, nil
+
+	case copiedMsg:
+		if msg.err != nil {
+			c.fail("copy failed: " + msg.err.Error())
+			return c, nil
+		}
+		c.note("Copied to clipboard")
 		return c, nil
 
 	case receiptSentMsg:
@@ -1307,12 +1317,35 @@ func (c ConversationsPage) handleKey(key tea.KeyPressMsg) (PageInterface, tea.Cm
 
 	case "ctrl+o":
 		message, ok := c.selectedMessage()
-		if !ok || !message.HasMedia() {
-			c.note("Pick a message with an attachment first")
+		if !ok {
+			c.note("Pick a message first: tab, then ↑↓ or click")
 			return c, nil
 		}
-		c.note("Opening…")
-		return c, openMedia(c.app, message)
+		// An attachment is the more specific thing to want; a link in its
+		// caption is the fallback.
+		if message.HasMedia() {
+			c.note("Opening…")
+			return c, openMedia(c.app, message)
+		}
+		if link, found := firstLink(message.Content); found {
+			c.note("Opening " + link)
+			return c, openLink(link)
+		}
+		c.note("Nothing to open here — no attachment and no link")
+		return c, nil
+
+	case "ctrl+y":
+		message, ok := c.selectedMessage()
+		if !ok {
+			c.note("Pick a message first: tab, then ↑↓ or click")
+			return c, nil
+		}
+		text := copyableText(message)
+		if text == "" {
+			c.note("Nothing to copy from this message")
+			return c, nil
+		}
+		return c, copyText(text)
 
 	case "enter":
 		// On the rail with nothing typed, enter opens the highlighted chat.

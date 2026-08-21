@@ -510,6 +510,116 @@ func TestPollsRender(t *testing.T) {
 	}
 }
 
+// ctrl+o hands a link straight to the desktop, and the link comes out of
+// somebody else's message -- so what counts as a link is a security boundary,
+// not just a parsing convenience.
+func TestFirstLinkOnlyOpensTheWeb(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		text string
+		want string // "" means nothing openable
+	}{
+		{"plain https", "see https://example.com/x", "https://example.com/x"},
+		{"plain http", "http://example.com", "http://example.com"},
+		{"bare www gets a scheme", "try www.example.com now", "https://www.example.com"},
+		{"sentence full stop is not a path", "go to https://example.com.", "https://example.com"},
+		{"trailing bracket", "(https://example.com)", "https://example.com"},
+		// Handed over exactly as typed, not re-encoded.
+		{"real brackets survive", "https://en.wikipedia.org/wiki/Go_(語)", "https://en.wikipedia.org/wiki/Go_(語)"},
+		{"no link at all", "just talking about example", ""},
+
+		// The ones that matter: a message must not be able to pick which
+		// program runs, or hand out a local path.
+		{"file url", "open file:///etc/passwd", ""},
+		{"javascript", "javascript:alert(1)", ""},
+		{"ssh url", "ssh://box/root", ""},
+		{"mailto", "mailto:someone@example.com", ""},
+		{"custom scheme", "zoommtg://zoom.us/join?x=1", ""},
+	} {
+		got, ok := firstLink(tc.text)
+		if tc.want == "" {
+			if ok {
+				t.Errorf("%s: opened %q, want nothing", tc.name, got)
+			}
+			continue
+		}
+		if !ok {
+			t.Errorf("%s: found no link in %q", tc.name, tc.text)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// Copying has to take the stored text, not what is on screen: the display is
+// folded down to ASCII for the column maths, and pasting a row of question
+// marks would be worse than pasting nothing.
+func TestCopyTakesTheStoredTextNotTheRenderedOne(t *testing.T) {
+	const original = "നമസ്കാരം 🙏 https://example.com"
+
+	message := db.Message{ID: "c1", ChatJID: groupJID, Content: original}
+	if got := copyableText(message); got != original {
+		t.Errorf("copied %q, want the stored text %q", got, original)
+	}
+	// Guard the premise: the rendered form really is lossy, so this test is
+	// not quietly checking nothing.
+	if plain(original) == original {
+		t.Skip("ASCII folding is off here, so there is nothing to distinguish")
+	}
+}
+
+func TestCopyableTextPerKindOfMessage(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		message db.Message
+		want    string
+	}{
+		{
+			name:    "ordinary text",
+			message: db.Message{Content: "El Psy Kongroo"},
+			want:    "El Psy Kongroo",
+		},
+		{
+			name:    "a deleted message has nothing to give",
+			message: db.Message{Content: "gone", Revoked: true},
+			want:    "",
+		},
+		{
+			name: "a poll copies as its question and options",
+			message: db.Message{Poll: db.Poll{
+				Question: "Lab trip?", Options: []string{"Yes", "No"},
+			}},
+			want: "Lab trip?\nYes\nNo",
+		},
+		{
+			name: "a downloaded attachment copies as its path",
+			message: db.Message{Media: db.Media{
+				Kind: db.MediaImage, Path: "/tmp/photo.jpg",
+			}},
+			want: "/tmp/photo.jpg",
+		},
+		{
+			name:    "an attachment not yet downloaded has no path to give",
+			message: db.Message{Media: db.Media{Kind: db.MediaImage}},
+			want:    "",
+		},
+		{
+			name: "a caption wins over the file path",
+			message: db.Message{
+				Content: "look at this",
+				Media:   db.Media{Kind: db.MediaImage, Path: "/tmp/photo.jpg"},
+			},
+			want: "look at this",
+		},
+	} {
+		if got := copyableText(tc.message); got != tc.want {
+			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
 // Scrolling the rail must not open anything. Opening every chat on the way
 // past marks them all read on the phone and pulls a transcript each time.
 func TestScrollingTheRailDoesNotOpenChats(t *testing.T) {
