@@ -3,6 +3,7 @@ package db
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -985,6 +986,23 @@ func (s *MessageStore) SetChatMeta(jid, kind string, pinned, muted, archived boo
 		return fmt.Errorf("set chat meta: %w", err)
 	}
 	return nil
+}
+
+// ChatExists reports whether a chat row has already been stored.
+//
+// Used to tell a chat's first appearance from a resync of one we already
+// track: history sync's unread count is trustworthy for the former and stale
+// for the latter. See storeConversationMeta in the client package.
+func (s *MessageStore) ChatExists(jid string) (bool, error) {
+	var exists int
+	err := s.conn.QueryRow(`SELECT 1 FROM chats WHERE jid = ?`, jid).Scan(&exists)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("check chat exists: %w", err)
+	}
+	return true, nil
 }
 
 // SetUnread replaces a chat's unread count, which is what history sync gives

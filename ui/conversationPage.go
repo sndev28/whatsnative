@@ -146,8 +146,16 @@ type ConversationsPage struct {
 	// openJID is the conversation on screen. The rail reorders under us --
 	// sending a message lifts that chat to the top -- so the open chat is
 	// tracked by identity, and cursor is only where the highlight sits.
-	openJID  string
-	cursor   int // highlighted row in the rail
+	openJID string
+	cursor  int // highlighted row in the rail
+
+	// railScroll is the index of the topmost chat drawn. It is deliberately
+	// its own field rather than derived from cursor: a click always lands on
+	// a row already on screen, so a click must never move it. Only the arrow
+	// keys and the wheel do, and only by the minimum needed to keep the
+	// highlight in view.
+	railScroll int
+
 	selected int // which message is picked out, -1 for none
 	scroll   int // transcript rows scrolled up from the newest
 
@@ -495,13 +503,32 @@ func (c ConversationsPage) selectedMessage() (db.Message, bool) {
 	return c.messages[c.selected], true
 }
 
-// firstChat is the topmost chat drawn, scrolled just enough to keep the cursor
-// on screen.
+// firstChat is the topmost chat drawn.
+//
+// This reads railScroll rather than deriving a position from cursor. Deriving
+// it -- "scrolled just enough to keep the cursor on screen" -- sounds right
+// but has exactly one answer for any cursor past the first page: the cursor
+// sits on the very last visible row. A click lands on a row that is already
+// visible, so moving the cursor there recomputed a completely different
+// window, one that put whatever you clicked at the bottom of the list. The
+// clamp here is only a safety net for a list that has shrunk since railScroll
+// was last set -- filtering, or a chat disappearing -- not the thing that
+// keeps the cursor in view; scrollToShow does that, and only where a jump was
+// actually requested.
 func (c ConversationsPage) firstChat(visible int) int {
-	if c.cursor < visible {
-		return 0
+	return max(0, min(c.railScroll, max(len(c.visible())-visible, 0)))
+}
+
+// scrollToShow adjusts a scroll offset by the minimum needed to bring index
+// into the visible window, and leaves it alone otherwise.
+func scrollToShow(offset, index, visible int) int {
+	if index < offset {
+		return index
 	}
-	return c.cursor - visible + 1
+	if index >= offset+visible {
+		return index - visible + 1
+	}
+	return offset
 }
 
 // --- rendering -----------------------------------------------------------
@@ -1137,6 +1164,11 @@ func (c ConversationsPage) action(event tea.Msg) (PageInterface, tea.Cmd) {
 		c.note("Synced history from phone")
 		return c, c.reload()
 
+	case client.ReadStateSynced:
+		// No banner: this can fire many times in a row catching up after a
+		// few days away, and each one is not news worth a status line.
+		return c, c.reload()
+
 	case client.Connected:
 		c.note("Connected as " + plain(msg.PushName))
 		// Reload both panes: anything drawn before the connection completed
@@ -1368,7 +1400,7 @@ func (c ConversationsPage) handleFilterKey(key tea.KeyPressMsg) (PageInterface, 
 	case "esc":
 		c.filtering = false
 		c.filter = c.filter.clear()
-		c.cursor = 0
+		c.cursor, c.railScroll = 0, 0
 		return c, nil
 
 	case "enter", "tab", "down", "up":
@@ -1382,7 +1414,7 @@ func (c ConversationsPage) handleFilterKey(key tea.KeyPressMsg) (PageInterface, 
 
 	c.filter = c.filter.update(key)
 	// The list underneath just changed, so start again at the top of it.
-	c.cursor = 0
+	c.cursor, c.railScroll = 0, 0
 	return c, nil
 }
 
@@ -1397,9 +1429,11 @@ func (c ConversationsPage) handleForwardKey(key tea.KeyPressMsg) (PageInterface,
 
 	case "up":
 		c.cursor = max(c.cursor-1, 0)
+		c.railScroll = scrollToShow(c.railScroll, c.cursor, c.railVisibleRows())
 		return c, nil
 	case "down":
 		c.cursor = min(c.cursor+1, max(len(c.visible())-1, 0))
+		c.railScroll = scrollToShow(c.railScroll, c.cursor, c.railVisibleRows())
 		return c, nil
 
 	case "enter":
@@ -1420,9 +1454,12 @@ func (c ConversationsPage) commitForward(index int) (PageInterface, tea.Cmd) {
 
 	c.forwarding = false
 	c.forwardMsg = db.Message{}
-	// Put the highlight back where the open conversation is.
+	// Put the highlight back where the open conversation is, scrolling to it:
+	// the picker could have been left scrolled anywhere on the rail, and
+	// otherwise the highlight would land outside the visible window.
 	if row := c.rowOf(c.openJID); row >= 0 {
 		c.cursor = row
+		c.railScroll = scrollToShow(c.railScroll, row, c.railVisibleRows())
 	}
 	c.note("Forwarding to " + plain(target.Name) + "…")
 
@@ -1651,7 +1688,7 @@ func (c ConversationsPage) selectTab(next tabKind) (PageInterface, tea.Cmd) {
 	}
 
 	c.tab = next
-	c.cursor = 0
+	c.cursor, c.railScroll = 0, 0
 	c.openJID = ""
 	c.scroll = 0
 	c.selected = -1
@@ -1669,7 +1706,13 @@ func (c ConversationsPage) selectTab(next tabKind) (PageInterface, tea.Cmd) {
 // phone and drags a transcript down the wire. Enter or a click opens.
 func (c ConversationsPage) moveCursor(delta int) (PageInterface, tea.Cmd) {
 	c.cursor = min(max(c.cursor+delta, 0), max(len(c.visible())-1, 0))
+	c.railScroll = scrollToShow(c.railScroll, c.cursor, c.railVisibleRows())
 	return c, nil
+}
+
+// railVisibleRows is how many chats fit on screen right now.
+func (c ConversationsPage) railVisibleRows() int {
+	return computeLayout(c.app.width, c.app.height, c.replyTo.ID != "").visibleChats()
 }
 
 func (c ConversationsPage) openChat(index int) (PageInterface, tea.Cmd) {

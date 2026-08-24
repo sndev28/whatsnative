@@ -26,6 +26,12 @@ func CreateClient(dbConn db.DBConn) *Session {
 	clientLog, closer := logger.Logger("client.log", false)
 
 	client := whatsmeow.NewClient(deviceStore, logger.WaLogAdapter{Log: clientLog})
+	// Without this, the very first sync of any app-state collection -- pins,
+	// read state -- decodes correctly but throws the resulting events away
+	// instead of telling us about them. That first sync is precisely the one
+	// that carries the account's current state, so skipping it would mean
+	// syncReadState's first run silently learns nothing.
+	client.EmitAppStateEventsOnFullSync = true
 
 	session := &Session{
 		WA:        client,

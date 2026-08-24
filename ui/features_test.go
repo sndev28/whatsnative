@@ -742,6 +742,134 @@ func TestHighlightFollowsItsOwnChatAcrossAReorder(t *testing.T) {
 	}
 }
 
+func TestScrollToShow(t *testing.T) {
+	for _, tc := range []struct {
+		name                   string
+		offset, index, visible int
+		want                   int
+	}{
+		{"already in view, unchanged", 5, 7, 10, 5},
+		{"above the window, jumps to it exactly", 10, 3, 5, 3},
+		{"at the last visible row, unchanged", 0, 4, 5, 0},
+		{"one past the window, minimum scroll", 0, 5, 5, 1},
+		{"far below, lands with index at the bottom row", 0, 20, 5, 16},
+	} {
+		if got := scrollToShow(tc.offset, tc.index, tc.visible); got != tc.want {
+			t.Errorf("%s: scrollToShow(%d, %d, %d) = %d, want %d",
+				tc.name, tc.offset, tc.index, tc.visible, got, tc.want)
+		}
+	}
+}
+
+// bigChatList builds a page with enough chats that the rail cannot show them
+// all at once, which is what the scrolling tests below need.
+func bigChatList(t *testing.T, count int) ConversationsPage {
+	t.Helper()
+	store := fixtureStore(t)
+	page := openConversationsPage(&app{messages: store, width: 96, height: 24})
+	for i := range count {
+		page.chats = append(page.chats, db.Chat{
+			JID:  fmt.Sprintf("%d@s.whatsapp.net", i),
+			Name: fmt.Sprintf("Chat %02d", i),
+			Kind: db.KindChat,
+		})
+	}
+	page.openJID = page.chats[0].JID
+	return page
+}
+
+// The bug report: scroll the rail down with the wheel or the arrows, then
+// click a chat that is not the one at the very bottom of the visible window.
+// Clicking has to open that chat without moving the window at all -- not
+// re-derive a scroll position from where the highlight lands, which is what
+// used to shove the clicked chat down to the last visible row.
+func TestClickingAVisibleChatDoesNotScrollTheRail(t *testing.T) {
+	page := bigChatList(t, 40)
+	l := computeLayout(page.app.width, page.app.height, false)
+	visible := l.visibleChats()
+	if visible >= 40 {
+		t.Fatalf("test needs a list taller than the rail; got %d visible of 40", visible)
+	}
+
+	// Scroll well past the first page.
+	moved := page
+	for range visible + 5 {
+		next, _ := moved.handleKey(tea.KeyPressMsg{Code: tea.KeyDown})
+		moved = next.(ConversationsPage)
+	}
+	windowBefore := moved.firstChat(visible)
+	if windowBefore == 0 {
+		t.Fatal("test needs the rail actually scrolled past the top")
+	}
+
+	// Click the second row of the CURRENT window, not the highlighted one.
+	targetRow := windowBefore + 1
+	y := l.chatTop + 1*chatEntryRows
+	clicked, cmd := moved.handleClick(tea.Mouse{X: 2, Y: y, Button: tea.MouseLeft})
+	got := clicked.(ConversationsPage)
+
+	wantJID := got.visible()[targetRow].JID
+	if got.openJID != wantJID {
+		t.Fatalf("click opened %q, want the chat at row %d (%q)", got.openJID, targetRow, wantJID)
+	}
+	if cmd == nil {
+		t.Error("opening a different chat should load its messages")
+	}
+	if got.firstChat(visible) != windowBefore {
+		t.Errorf("the window moved from %d to %d -- clicking scrolled the rail", windowBefore, got.firstChat(visible))
+	}
+
+	// And the newly opened chat must still be one of the rows actually drawn,
+	// or "didn't scroll" would be true only because nothing is visible either.
+	if targetRow < got.firstChat(visible) || targetRow >= got.firstChat(visible)+visible {
+		t.Errorf("row %d is outside the drawn window [%d, %d)", targetRow, got.firstChat(visible), got.firstChat(visible)+visible)
+	}
+}
+
+// Arrow-key movement is the one thing that should still scroll, and only by
+// the minimum needed to keep the highlight on screen -- not by jumping to
+// whatever window would put the highlight at the very bottom.
+func TestArrowKeysScrollByTheMinimumNeeded(t *testing.T) {
+	page := bigChatList(t, 40)
+	l := computeLayout(page.app.width, page.app.height, false)
+	visible := l.visibleChats()
+	if visible >= 40 {
+		t.Fatalf("test needs a list taller than the rail; got %d visible of 40", visible)
+	}
+
+	// Step down one row past the edge of the first page.
+	moved := page
+	for range visible {
+		next, _ := moved.handleKey(tea.KeyPressMsg{Code: tea.KeyDown})
+		moved = next.(ConversationsPage)
+	}
+	if got := moved.firstChat(visible); got != 1 {
+		t.Fatalf("one step past the edge scrolled to %d, want 1 (the minimum)", got)
+	}
+
+	// Stepping back up lands the cursor one row inside that same window, so
+	// "minimal" means the window does not move at all yet -- only actually
+	// leaving it should scroll it back.
+	back, _ := moved.handleKey(tea.KeyPressMsg{Code: tea.KeyUp})
+	moved = back.(ConversationsPage)
+	if got := moved.firstChat(visible); got != 1 {
+		t.Errorf("a step that stayed inside the window moved it to %d, want it to stay at 1", got)
+	}
+
+	// Walking all the way back to the first chat does eventually have to
+	// scroll the window back to the top.
+	for range visible {
+		next, _ := moved.handleKey(tea.KeyPressMsg{Code: tea.KeyUp})
+		moved = next.(ConversationsPage)
+	}
+	if moved.cursor != 0 {
+		t.Fatalf("cursor is %d, want back at the first chat", moved.cursor)
+	}
+	if got := moved.firstChat(visible); got != 0 {
+		t.Errorf("with the cursor back at the top, window is %d, want 0", got)
+	}
+}
+
 // A chat entry is four rows -- name, preview, a blank and a separator -- and
 // all four are part of the thing you are clicking on.
 //
@@ -1028,8 +1156,8 @@ func TestGraphemeCountTreatsEmojiAsOneCharacter(t *testing.T) {
 		want int
 	}{
 		{"😂", 1},
-		{"❤️", 1},   // heart + variation selector
-		{"👍🏽", 1},   // thumbs-up + skin tone
+		{"❤️", 1},    // heart + variation selector
+		{"👍🏽", 1},    // thumbs-up + skin tone
 		{"👨‍👩‍👧", 1}, // joined family
 		{"😂😂", 2},
 		{"", 0},

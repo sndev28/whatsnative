@@ -59,6 +59,11 @@ type (
 	// HistorySynced means the phone sent a backlog and stored chats changed.
 	HistorySynced struct{}
 
+	// ReadStateSynced means a chat's read state was learned from the account
+	// -- the phone marked something read while this device was offline, or on
+	// another device -- rather than from anything typed here.
+	ReadStateSynced struct{}
+
 	// Failure is a non-fatal error worth showing in the status line.
 	Failure struct{ Err error }
 )
@@ -455,6 +460,8 @@ func (s *Session) handleEvent(rawEvent any) {
 		s.onContact(event)
 	case *events.Receipt:
 		s.onReceipt(event)
+	case *events.MarkChatAsRead:
+		s.onMarkChatAsRead(event)
 	case *events.LoggedOut:
 		s.emit(LoggedOut{})
 	}
@@ -513,6 +520,22 @@ func (s *Session) onReceipt(event *events.Receipt) {
 func (s *Session) storeConversationMeta(chatJID types.JID, conversation *waHistorySync.Conversation) {
 	kind := kindForJID(chatJID)
 
+	// Captured before anything below writes to the chat, since SetChatMeta
+	// creates the row if it is missing and would make every chat look
+	// "already known" by the time the unread count is considered.
+	//
+	// The unread count that comes with history sync is trustworthy exactly
+	// once: the first time this chat is ever seen, it is the only signal
+	// there is. Every sync after that, it is relative to this device's own
+	// last checkpoint rather than to what the account has actually read, and
+	// trusting it again would restamp a stale count over a chat syncReadState
+	// has already corrected -- which is exactly what made a few days offline
+	// come back showing everything unread.
+	known, err := s.messages.ChatExists(chatJID.String())
+	if err != nil {
+		s.emit(Failure{Err: err})
+	}
+
 	name := conversation.GetName()
 	if name == "" {
 		name = conversation.GetDisplayName()
@@ -531,9 +554,11 @@ func (s *Session) storeConversationMeta(chatJID types.JID, conversation *waHisto
 		s.emit(Failure{Err: err})
 	}
 
-	if unread := conversation.GetUnreadCount(); unread > 0 {
-		if err := s.messages.SetUnread(chatJID.String(), int(unread)); err != nil {
-			s.emit(Failure{Err: err})
+	if !known {
+		if unread := conversation.GetUnreadCount(); unread > 0 {
+			if err := s.messages.SetUnread(chatJID.String(), int(unread)); err != nil {
+				s.emit(Failure{Err: err})
+			}
 		}
 	}
 }
@@ -558,6 +583,7 @@ func (s *Session) onConnected() {
 
 	s.identifySelf()
 	s.syncAddressBook(ctx)
+	s.syncReadState(ctx)
 	s.refreshContacts(ctx)
 	s.refreshGroups(ctx)
 	s.refreshNewsletters(ctx)
@@ -606,6 +632,43 @@ func (s *Session) syncAddressBook(ctx context.Context) {
 		// Not fatal: we fall back to profile names, marked with a tilde.
 		s.emit(Failure{Err: fmt.Errorf("sync contact list: %w", err)})
 	}
+}
+
+// syncReadState catches this device up on which chats the account has read.
+//
+// History sync's unread count is only trustworthy the first time a chat is
+// seen: after that it is relative to this device's own last checkpoint, not
+// to what has actually been read, so days spent offline come back showing
+// everything unread even though the phone read it all. The account's true
+// read state travels as "regular_low" app-state patches -- the same channel
+// pin state and the account's own read receipts to itself go through -- and
+// asking for it here, on every connect, is what lets a reconnect catch up on
+// however long this device was away, not just whatever changes happen while
+// it stays open.
+func (s *Session) syncReadState(ctx context.Context) {
+	if err := s.WA.FetchAppState(ctx, appstate.WAPatchRegularLow, false, false); err != nil {
+		// Not fatal: the chat still opens, just possibly with a stale unread
+		// count until the next reconnect or a live update corrects it.
+		s.emit(Failure{Err: fmt.Errorf("sync read state: %w", err)})
+	}
+}
+
+// onMarkChatAsRead applies the account's true read state to a chat.
+//
+// This is the inbound half of the read-receipt work: MarkRead on the Session
+// sends a receipt outward for what is read here. This is what comes back the
+// other way -- read on the phone, on another device, or while this one was
+// offline -- and it is local only. Nothing needs telling a second time.
+func (s *Session) onMarkChatAsRead(event *events.MarkChatAsRead) {
+	if !event.Action.GetRead() {
+		// Marked unread on purpose; there is nothing local to clear.
+		return
+	}
+	if err := s.messages.MarkRead(event.JID.String()); err != nil {
+		s.emit(Failure{Err: err})
+		return
+	}
+	s.emit(ReadStateSynced{})
 }
 
 func (s *Session) refreshContacts(ctx context.Context) {
