@@ -413,13 +413,14 @@ func autoDownload(a *app, messages []db.Message) tea.Cmd {
 		switch message.Media.Kind {
 		case db.MediaSticker:
 			// A sticker already draws from its embedded still, so this is only
-			// about getting the full-quality file for the static ones.
-			if stickers < stickerDownloadLimit {
+			// about getting the full-quality file for the static ones -- not
+			// worth the fetch at all if stickers are not being drawn anyway.
+			if a.showStickers && stickers < stickerDownloadLimit {
 				stickers++
 				commands = append(commands, downloadMedia(a, message))
 			}
 		case db.MediaImage:
-			if photos < autoDownloadLimit {
+			if a.showPhotos && photos < autoDownloadLimit {
 				photos++
 				commands = append(commands, downloadMedia(a, message))
 			}
@@ -434,6 +435,18 @@ func autoDownload(a *app, messages []db.Message) tea.Cmd {
 
 func isPicture(media db.Media) bool {
 	return media.Kind == db.MediaImage || media.Kind == db.MediaSticker
+}
+
+// mediaHidden reports whether a picture is being deliberately skipped, as
+// opposed to one that tried to draw and could not.
+func (c ConversationsPage) mediaHidden(media db.Media) bool {
+	switch media.Kind {
+	case db.MediaImage:
+		return !c.app.showPhotos
+	case db.MediaSticker:
+		return !c.app.showStickers
+	}
+	return false
 }
 
 // visible is the chat list after the search box has had its say. Everything
@@ -783,9 +796,10 @@ func (c ConversationsPage) messageLines(message db.Message, index, width int, sh
 	chip := ""
 	if message.HasMedia() && picture == nil {
 		chip = mediaChip(message.Media)
-		if isPicture(message.Media) && message.Media.Path != "" {
+		if isPicture(message.Media) && message.Media.Path != "" && !c.mediaHidden(message.Media) {
 			// We have the file and still could not draw it, which is worth
-			// saying rather than looking like it is still downloading.
+			// saying rather than looking like it is still downloading. Not
+			// true here if the picture is just turned off on purpose.
 			chip += "  no preview"
 		}
 	}
@@ -866,6 +880,12 @@ func (c ConversationsPage) gutter(index int) string {
 // not decode (animated stickers being the usual one).
 func (c ConversationsPage) pictureRows(message db.Message, indent string, body int) []string {
 	if !isPicture(message.Media) {
+		return nil
+	}
+	if c.mediaHidden(message.Media) {
+		// Skip the decode entirely, which is the actual cost in a
+		// picture-heavy chat -- not the few bytes of the chip the caller
+		// falls back to once this returns nil.
 		return nil
 	}
 
@@ -1007,7 +1027,7 @@ func (c ConversationsPage) statusLine(l layout) string {
 		return cell(" "+accentStyle.Render("Browsing files · enter opens · backspace up · esc cancels"), l.width)
 	}
 
-	help := "ctrl+f find · ctrl+u send file · dbl-click reply · ctrl+e react · ctrl+y copy · ctrl+o open · ctrl+d delete · ctrl+w forward"
+	help := "ctrl+f find · ctrl+u send file · dbl-click reply · ctrl+e react · ctrl+y copy · ctrl+o open · ctrl+d delete · ctrl+w forward · ctrl+g settings"
 	return cell(" "+mutedStyle.Render(truncate(help, l.width-2)), l.width)
 }
 
@@ -1283,6 +1303,11 @@ func (c ConversationsPage) handleKey(key tea.KeyPressMsg) (PageInterface, tea.Cm
 
 	case "ctrl+t":
 		return c.selectTab(tabKind((int(c.tab) + 1) % len(tabNames)))
+
+	case "ctrl+g":
+		// c is the value as of right now -- cursor, scroll, open chat and
+		// all -- and comes back exactly as it is the moment settings closes.
+		return openSettingsPage(c.app, c), nil
 
 	case "tab":
 		if c.focus == focusChats {

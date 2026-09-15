@@ -134,7 +134,7 @@ func TestRowsAreExactUnderEitherRuler(t *testing.T) {
 		useWidthMode(t, mode)
 
 		for _, width := range []int{70, 96, 120} {
-			page := openConversationsPage(&app{messages: store, width: width, height: 24})
+			page := openConversationsPage(&app{messages: store, width: width, height: 24, showPhotos: true, showStickers: true})
 			page.chats = chats
 			page.status = ""
 			for i, chat := range chats {

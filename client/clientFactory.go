@@ -25,6 +25,12 @@ func CreateClient(dbConn db.DBConn) *Session {
 	// into a closed handle. The Session owns the closer and shuts it down.
 	clientLog, closer := logger.Logger("client.log", false)
 
+	// Before the client exists, and so before anything can be decrypted.
+	// libsignal's own logger writes to stdout, which is the terminal the UI
+	// draws on -- a failed decryption would otherwise print itself straight
+	// over the interface.
+	logger.CaptureSignalLogs(clientLog.With("module", "signal"))
+
 	client := whatsmeow.NewClient(deviceStore, logger.WaLogAdapter{Log: clientLog})
 	// Without this, the very first sync of any app-state collection -- pins,
 	// read state -- decodes correctly but throws the resulting events away

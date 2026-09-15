@@ -243,6 +243,14 @@ CREATE TABLE IF NOT EXISTS emoji_uses (
 	uses      INTEGER NOT NULL DEFAULT 0,
 	last_used INTEGER NOT NULL DEFAULT 0
 );
+
+-- User preferences that should survive a restart, e.g. whether pictures
+-- render at all. One table for all of them rather than a column per setting,
+-- so a new one never needs its own migration.
+CREATE TABLE IF NOT EXISTS settings (
+	key   TEXT PRIMARY KEY,
+	value TEXT NOT NULL
+);
 `
 
 // addedColumns are applied on top of the base schema, per table.
@@ -1109,6 +1117,66 @@ func (s *MessageStore) SetReadThrough(jid string, through time.Time) error {
 		return fmt.Errorf("set read through: %w", err)
 	}
 	return nil
+}
+
+// Setting keys. Kept private: the typed accessors below are the real API, so
+// a caller can never persist a setting under a name nothing reads back.
+const (
+	settingShowPhotos   = "show_photos"
+	settingShowStickers = "show_stickers"
+)
+
+// boolSetting reads a stored preference, falling back when it has never been
+// set -- which is every preference, the first time this device runs.
+func (s *MessageStore) boolSetting(key string, fallback bool) (bool, error) {
+	var value string
+	err := s.conn.QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&value)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return fallback, nil
+	case err != nil:
+		return fallback, fmt.Errorf("read setting %s: %w", key, err)
+	}
+	return value == "1", nil
+}
+
+func (s *MessageStore) setBoolSetting(key string, value bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	stored := "0"
+	if value {
+		stored = "1"
+	}
+	_, err := s.conn.Exec(
+		`INSERT INTO settings (key, value) VALUES (?, ?)
+		 ON CONFLICT (key) DO UPDATE SET value = excluded.value`,
+		key, stored,
+	)
+	if err != nil {
+		return fmt.Errorf("save setting %s: %w", key, err)
+	}
+	return nil
+}
+
+// ShowPhotos reports whether photos should be decoded and drawn inline.
+// Default on: this is the behaviour before the setting existed at all.
+func (s *MessageStore) ShowPhotos() (bool, error) { return s.boolSetting(settingShowPhotos, true) }
+
+func (s *MessageStore) SetShowPhotos(show bool) error {
+	return s.setBoolSetting(settingShowPhotos, show)
+}
+
+// ShowStickers reports whether stickers should be decoded and drawn inline.
+// Default on, same as ShowPhotos: this is what a chat looked like before
+// either setting existed, and slow rendering is something to opt out of, not
+// something to spring as a changed default.
+func (s *MessageStore) ShowStickers() (bool, error) {
+	return s.boolSetting(settingShowStickers, true)
+}
+
+func (s *MessageStore) SetShowStickers(show bool) error {
+	return s.setBoolSetting(settingShowStickers, show)
 }
 
 // RecordEmojiUse counts one more reaction sent with this emoji.

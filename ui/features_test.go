@@ -447,7 +447,7 @@ func TestConsecutiveMessagesShareAName(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	page := openConversationsPage(&app{messages: store, width: 96, height: 24})
+	page := openConversationsPage(&app{messages: store, width: 96, height: 24, showPhotos: true, showStickers: true})
 	page.messages = messages
 	page.chats = []db.Chat{{JID: groupJID, Name: "Lab", Kind: db.KindGroup, IsGroup: true}}
 
@@ -495,7 +495,7 @@ func TestPollsRender(t *testing.T) {
 		t.Fatalf("got %d options, want 3", len(poll.Poll.Options))
 	}
 
-	page := openConversationsPage(&app{messages: store, width: 96, height: 24})
+	page := openConversationsPage(&app{messages: store, width: 96, height: 24, showPhotos: true, showStickers: true})
 	page.messages = []db.Message{poll}
 	page.chats = []db.Chat{{JID: groupJID, Name: "Lab", Kind: db.KindGroup, IsGroup: true}}
 
@@ -766,7 +766,7 @@ func TestScrollToShow(t *testing.T) {
 func bigChatList(t *testing.T, count int) ConversationsPage {
 	t.Helper()
 	store := fixtureStore(t)
-	page := openConversationsPage(&app{messages: store, width: 96, height: 24})
+	page := openConversationsPage(&app{messages: store, width: 96, height: 24, showPhotos: true, showStickers: true})
 	for i := range count {
 		page.chats = append(page.chats, db.Chat{
 			JID:  fmt.Sprintf("%d@s.whatsapp.net", i),
@@ -879,7 +879,7 @@ func TestArrowKeysScrollByTheMinimumNeeded(t *testing.T) {
 // that left the chat under the pointer as the one click could not open.
 func TestEveryRowOfAChatEntryOpensIt(t *testing.T) {
 	store := fixtureStore(t)
-	page := openConversationsPage(&app{messages: store, width: 200, height: 50})
+	page := openConversationsPage(&app{messages: store, width: 200, height: 50, showPhotos: true, showStickers: true})
 	for i := range 12 {
 		page.chats = append(page.chats, db.Chat{
 			JID:  fmt.Sprintf("%d@s.whatsapp.net", i),
@@ -1191,6 +1191,91 @@ func TestEscapeFromCustomReactionReturnsToPalette(t *testing.T) {
 	}
 }
 
+// writeTestImage puts a decodable PNG on disk at a distinct path, so
+// renderImage has something real to cache under. The cache keys on path, not
+// content, so the bytes themselves do not need to differ.
+func writeTestImage(t *testing.T, dir string, n int) string {
+	t.Helper()
+	path := filepath.Join(dir, fmt.Sprintf("img%d.png", n))
+	if err := os.WriteFile(path, testPNGBytes(4, 4), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func resetImageCache() {
+	imageCache.Lock()
+	imageCache.rows = map[string][]string{}
+	imageCache.order = nil
+	imageCache.width, imageCache.height = 0, 0
+	imageCache.Unlock()
+}
+
+// A resize used to add a second full copy of every cached image under the new
+// width, forever: the old copies were never cleaned up, because nothing would
+// ever ask for that width again. This is what actually grew over days of a
+// session left open across resizes.
+func TestImageCacheDropsTheOldSizeOnResize(t *testing.T) {
+	resetImageCache()
+	dir := t.TempDir()
+
+	for i := range 5 {
+		if _, err := renderImage(writeTestImage(t, dir, i), 20, 9); err != nil {
+			t.Fatal(err)
+		}
+	}
+	imageCache.Lock()
+	before := len(imageCache.rows)
+	imageCache.Unlock()
+	if before != 5 {
+		t.Fatalf("cache holds %d entries, want 5", before)
+	}
+
+	// A resize: the same five images, asked for at a different width.
+	for i := range 5 {
+		if _, err := renderImage(writeTestImage(t, dir, i), 16, 9); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	imageCache.Lock()
+	after := len(imageCache.rows)
+	imageCache.Unlock()
+	if after != 5 {
+		t.Errorf("cache holds %d entries after a resize, want still 5 -- the old size was kept alongside the new one", after)
+	}
+}
+
+// A long session that never resizes but scrolls through a great many pictures
+// needs its own ceiling, or the cache still grows without bound.
+func TestImageCacheEvictsOldestPastTheLimit(t *testing.T) {
+	resetImageCache()
+	dir := t.TempDir()
+
+	first := writeTestImage(t, dir, 0)
+	if _, err := renderImage(first, 20, 9); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 1; i <= imageCacheLimit; i++ {
+		if _, err := renderImage(writeTestImage(t, dir, i), 20, 9); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	imageCache.Lock()
+	count := len(imageCache.rows)
+	_, firstStillCached := imageCache.rows[first]
+	imageCache.Unlock()
+
+	if count > imageCacheLimit {
+		t.Errorf("cache holds %d entries, want at most %d", count, imageCacheLimit)
+	}
+	if firstStillCached {
+		t.Error("the oldest image is still cached; nothing was evicted")
+	}
+}
+
 // View-once media is kept like anything else, so the reader has to be told
 // which it is: the sender believes it is already gone.
 func TestViewOnceIsLabelled(t *testing.T) {
@@ -1243,7 +1328,7 @@ func TestViewOnceIsLabelled(t *testing.T) {
 		t.Errorf("preview is %q, want %q", got, "[view once photo]")
 	}
 
-	page := openConversationsPage(&app{messages: store, width: 96, height: 24})
+	page := openConversationsPage(&app{messages: store, width: 96, height: 24, showPhotos: true, showStickers: true})
 	page.messages = []db.Message{byID["vo1"]}
 	page.chats = []db.Chat{{JID: groupJID, Name: "Lab", Kind: db.KindGroup, IsGroup: true}}
 
@@ -1261,7 +1346,7 @@ func TestViewOnceIsLabelled(t *testing.T) {
 func TestViewOnceIsLabelledOnADrawnPicture(t *testing.T) {
 	store := streamsStore(t)
 
-	page := openConversationsPage(&app{messages: store, width: 96, height: 24})
+	page := openConversationsPage(&app{messages: store, width: 96, height: 24, showPhotos: true, showStickers: true})
 	page.chats = []db.Chat{{JID: groupJID, Name: "Lab", Kind: db.KindGroup, IsGroup: true}}
 	page.messages = []db.Message{{
 		ID: "vo2", ChatJID: groupJID, SenderJID: daruJID, Sender: "Daru", IsGroup: true,
@@ -1321,7 +1406,7 @@ func TestReactionsShowOnMediaMessages(t *testing.T) {
 		t.Fatalf("got %d reactions on the photo, want 1", len(image.Reactions))
 	}
 
-	page := openConversationsPage(&app{messages: store, width: 96, height: 24})
+	page := openConversationsPage(&app{messages: store, width: 96, height: 24, showPhotos: true, showStickers: true})
 	page.messages = []db.Message{image}
 	page.chats = []db.Chat{{JID: groupJID, Name: "Lab", Kind: db.KindGroup, IsGroup: true}}
 
@@ -1680,7 +1765,7 @@ func TestSearchFiltersAndIndexesTheSameList(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	page := openConversationsPage(&app{messages: store, width: 96, height: 24})
+	page := openConversationsPage(&app{messages: store, width: 96, height: 24, showPhotos: true, showStickers: true})
 	page.chats = chats
 	page.status = ""
 
@@ -1722,7 +1807,7 @@ func TestEscapeClearsTheSearch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	page := openConversationsPage(&app{messages: store, width: 96, height: 24})
+	page := openConversationsPage(&app{messages: store, width: 96, height: 24, showPhotos: true, showStickers: true})
 	page.chats = chats
 	page.filtering = true
 	page.filter = typeText(textInput{}, "zzzz")
@@ -1874,7 +1959,7 @@ func TestClickingATabSwitchesStream(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	page := openConversationsPage(&app{messages: store, width: 96, height: 24})
+	page := openConversationsPage(&app{messages: store, width: 96, height: 24, showPhotos: true, showStickers: true})
 	page.chats = chats
 	l := computeLayout(96, 24, false)
 
@@ -1911,7 +1996,7 @@ func TestRailEntriesAreUniformHeight(t *testing.T) {
 		t.Fatalf("need at least three chats, got %d", len(chats))
 	}
 
-	page := openConversationsPage(&app{messages: store, width: 96, height: 40})
+	page := openConversationsPage(&app{messages: store, width: 96, height: 40, showPhotos: true, showStickers: true})
 	page.chats = chats
 	l := computeLayout(96, 40, false)
 
@@ -1980,7 +2065,7 @@ func TestOpenChatFollowsTheRailReordering(t *testing.T) {
 		t.Fatalf("need three chats, got %d", len(chats))
 	}
 
-	page := openConversationsPage(&app{messages: store, width: 96, height: 30})
+	page := openConversationsPage(&app{messages: store, width: 96, height: 30, showPhotos: true, showStickers: true})
 	page.chats = chats
 	page.status = ""
 
@@ -2037,7 +2122,7 @@ func TestSearchDoesNotChangeTheOpenConversation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	page := openConversationsPage(&app{messages: store, width: 96, height: 30})
+	page := openConversationsPage(&app{messages: store, width: 96, height: 30, showPhotos: true, showStickers: true})
 	page.chats = chats
 	page.status = ""
 
@@ -2100,7 +2185,7 @@ func TestRevokedMessagesShowAPlaceholder(t *testing.T) {
 		t.Errorf("preview is %q, want [deleted]", revoked.Preview())
 	}
 
-	page := openConversationsPage(&app{messages: store, width: 96, height: 24})
+	page := openConversationsPage(&app{messages: store, width: 96, height: 24, showPhotos: true, showStickers: true})
 	page.messages = []db.Message{revoked}
 	page.chats = []db.Chat{{JID: groupJID, Name: "Lab", Kind: db.KindGroup, IsGroup: true}}
 
@@ -2125,7 +2210,7 @@ func TestForwardPicksADestination(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	page := openConversationsPage(&app{messages: store, width: 96, height: 30})
+	page := openConversationsPage(&app{messages: store, width: 96, height: 30, showPhotos: true, showStickers: true})
 	page.chats = chats
 	page.status = ""
 	opened, _ := page.openChat(0)
@@ -2186,7 +2271,7 @@ func TestDroppedFileBecomesAnAttachment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	page := openConversationsPage(&app{messages: store, width: 96, height: 30})
+	page := openConversationsPage(&app{messages: store, width: 96, height: 30, showPhotos: true, showStickers: true})
 	page.chats = chats
 	opened, _ := page.openChat(0)
 	page = opened.(ConversationsPage)
@@ -2233,7 +2318,7 @@ func TestPendingAttachmentIsSentOnEnter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	page := openConversationsPage(&app{messages: store, width: 96, height: 30})
+	page := openConversationsPage(&app{messages: store, width: 96, height: 30, showPhotos: true, showStickers: true})
 	page.chats = chats
 	opened, _ := page.openChat(0)
 	page = opened.(ConversationsPage)
@@ -2299,7 +2384,7 @@ func TestStickersDrawFromTheEmbeddedThumbnail(t *testing.T) {
 		t.Fatal("the thumbnail did not survive the round trip")
 	}
 
-	page := openConversationsPage(&app{messages: store, width: 96, height: 24})
+	page := openConversationsPage(&app{messages: store, width: 96, height: 24, showPhotos: true, showStickers: true})
 	page.messages = []db.Message{sticker}
 	page.chats = []db.Chat{{JID: groupJID, Name: "Lab", Kind: db.KindGroup, IsGroup: true}}
 
@@ -2333,7 +2418,7 @@ func TestEveryStickerIsFetched(t *testing.T) {
 		t.Fatalf("fixture needs fewer than %d stickers", stickerDownloadLimit)
 	}
 
-	cmd := autoDownload(&app{messages: store}, messages)
+	cmd := autoDownload(&app{messages: store, showPhotos: true, showStickers: true}, messages)
 	if cmd == nil {
 		t.Fatal("nothing was queued for download")
 	}
@@ -2361,13 +2446,217 @@ func TestPhotosAreStillRationed(t *testing.T) {
 		})
 	}
 
-	batch, ok := autoDownload(&app{messages: store}, messages)().(tea.BatchMsg)
+	batch, ok := autoDownload(&app{messages: store, showPhotos: true, showStickers: true}, messages)().(tea.BatchMsg)
 	if !ok {
 		t.Fatal("expected a batch")
 	}
 	if len(batch) != autoDownloadLimit {
 		t.Errorf("queued %d photo downloads, want %d", len(batch), autoDownloadLimit)
 	}
+}
+
+// With stickers turned off, nothing about them should be fetched either --
+// there is no point spending the network round trip on a picture that is
+// never going to be decoded.
+func TestStickersOffSkipsTheDownloadToo(t *testing.T) {
+	store := streamsStore(t)
+	base := time.Date(2026, time.August, 17, 10, 0, 0, 0, time.UTC)
+
+	messages := []db.Message{
+		{ID: "s1", ChatJID: groupJID, Timestamp: base, Media: db.Media{Kind: db.MediaSticker, Proto: []byte("x")}},
+		{ID: "p1", ChatJID: groupJID, Timestamp: base.Add(time.Minute), Media: db.Media{Kind: db.MediaImage, Proto: []byte("x")}},
+	}
+
+	cmd := autoDownload(&app{messages: store, showPhotos: true, showStickers: false}, messages)
+	if cmd == nil {
+		t.Fatal("the photo should still have been queued")
+	}
+	batch, ok := cmd().(tea.BatchMsg)
+	if !ok {
+		batch = tea.BatchMsg{cmd}
+	}
+	if len(batch) != 1 {
+		t.Errorf("queued %d downloads with stickers off, want just the photo", len(batch))
+	}
+}
+
+// The same thing, the other way round: photos off should not spend a fetch on
+// a photo either.
+func TestPhotosOffSkipsTheDownloadToo(t *testing.T) {
+	store := streamsStore(t)
+	base := time.Date(2026, time.August, 17, 10, 0, 0, 0, time.UTC)
+
+	messages := []db.Message{
+		{ID: "s1", ChatJID: groupJID, Timestamp: base, Media: db.Media{Kind: db.MediaSticker, Proto: []byte("x")}},
+		{ID: "p1", ChatJID: groupJID, Timestamp: base.Add(time.Minute), Media: db.Media{Kind: db.MediaImage, Proto: []byte("x")}},
+	}
+
+	cmd := autoDownload(&app{messages: store, showPhotos: false, showStickers: true}, messages)
+	if cmd == nil {
+		t.Fatal("the sticker should still have been queued")
+	}
+	batch, ok := cmd().(tea.BatchMsg)
+	if !ok {
+		batch = tea.BatchMsg{cmd}
+	}
+	if len(batch) != 1 {
+		t.Errorf("queued %d downloads with photos off, want just the sticker", len(batch))
+	}
+}
+
+// Off, a sticker draws as its chip, exactly like one that failed to decode --
+// but without the decode ever running, which is the actual cost being avoided
+// in a sticker-heavy chat.
+func TestStickersOffShowsTheChipInstead(t *testing.T) {
+	page := fixturePage(t, 96, 24)
+	page.app.showStickers = false
+	page.messages = []db.Message{{
+		ID: "sticker1", ChatJID: daruJID, Sender: "Daru",
+		Timestamp: time.Now(),
+		Media:     db.Media{Kind: db.MediaSticker, Path: "/does/not/exist.webp"},
+	}}
+
+	var rendered strings.Builder
+	for _, line := range page.transcript(60) {
+		rendered.WriteString(stripANSIForTest.ReplaceAllString(line.text, ""))
+		rendered.WriteString("\n")
+	}
+	if !strings.Contains(rendered.String(), "[sticker]") {
+		t.Errorf("transcript does not show the [sticker] chip:\n%s", rendered.String())
+	}
+	if strings.Contains(rendered.String(), "no preview") {
+		t.Error(`turning stickers off should not read as "no preview" -- that implies a decode failure`)
+	}
+}
+
+// ctrl+g opens settings without disturbing the conversation underneath: the
+// cursor, scroll and open chat all have to come back exactly as they were.
+func TestCtrlGOpensSettingsAndReturnsToTheSameState(t *testing.T) {
+	page := bigChatList(t, 40)
+	l := computeLayout(page.app.width, page.app.height, false)
+	visible := l.visibleChats()
+
+	// Scroll somewhere that is not the top, so there is something to lose.
+	moved := page
+	for range visible + 3 {
+		next, _ := moved.handleKey(tea.KeyPressMsg{Code: tea.KeyDown})
+		moved = next.(ConversationsPage)
+	}
+	beforeCursor, beforeScroll, beforeOpen := moved.cursor, moved.firstChat(visible), moved.openJID
+
+	opened, cmd := moved.handleKey(tea.KeyPressMsg{Code: 'g', Mod: tea.ModCtrl})
+	settings, ok := opened.(SettingsPage)
+	if !ok {
+		t.Fatalf("ctrl+g opened %T, want SettingsPage", opened)
+	}
+	if cmd != nil {
+		t.Error("opening settings should not need a command")
+	}
+
+	back, _ := settings.action(tea.KeyPressMsg{Code: tea.KeyEscape})
+	page2, ok := back.(ConversationsPage)
+	if !ok {
+		t.Fatalf("esc from settings returned %T, want ConversationsPage", back)
+	}
+	if page2.cursor != beforeCursor || page2.firstChat(visible) != beforeScroll || page2.openJID != beforeOpen {
+		t.Errorf("state changed across settings: cursor %d->%d, scroll %d->%d, open %q->%q",
+			beforeCursor, page2.cursor, beforeScroll, page2.firstChat(visible), beforeOpen, page2.openJID)
+	}
+}
+
+// Toggling a row applies immediately -- app is shared by pointer, so every
+// page sees it the instant it changes -- and separately persists, so it is
+// still applied the next time the app starts.
+func TestSettingsToggleAppliesImmediatelyAndPersists(t *testing.T) {
+	store := fixtureStore(t)
+	a := &app{messages: store, width: 96, height: 24, showPhotos: true, showStickers: true}
+	settings := openSettingsPage(a, openConversationsPage(a))
+
+	// Row 0 is "Show photos".
+	toggled, cmd := settings.action(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if a.showPhotos {
+		t.Error("toggling did not flip app.showPhotos immediately")
+	}
+	if cmd == nil {
+		t.Fatal("toggling should return the command that persists it")
+	}
+
+	msg := cmd()
+	if saved, ok := msg.(settingsSavedMsg); !ok || saved.err != nil {
+		t.Fatalf("save failed: %v", msg)
+	}
+	stored, err := store.ShowPhotos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored {
+		t.Error("the store still has photos on after the toggle was saved")
+	}
+
+	// Applying the save result back in should not itself change anything.
+	settled, _ := toggled.action(msg.(settingsSavedMsg))
+	if settled.(SettingsPage).failed {
+		t.Error("a successful save should not be reported as failed")
+	}
+}
+
+// Down moves to stickers, and toggling that one leaves photos untouched --
+// the two are independent.
+func TestSettingsDownMovesToStickersRow(t *testing.T) {
+	store := fixtureStore(t)
+	a := &app{messages: store, width: 96, height: 24, showPhotos: true, showStickers: true}
+	settings := openSettingsPage(a, openConversationsPage(a))
+
+	moved, _ := settings.action(tea.KeyPressMsg{Code: tea.KeyDown})
+	toggled, _ := moved.action(tea.KeyPressMsg{Code: tea.KeyEnter})
+
+	if !a.showPhotos {
+		t.Error("toggling the stickers row also touched photos")
+	}
+	if a.showStickers {
+		t.Error("down then enter did not toggle the stickers row")
+	}
+	_ = toggled
+}
+
+// The whole point, end to end: turn stickers off in settings, back out, and
+// the chat that was slow to open now shows the chip instead.
+func TestSettingsToggleChangesWhatTheChatDraws(t *testing.T) {
+	page := fixturePage(t, 96, 24)
+	page.messages = []db.Message{{
+		ID: "sticker1", ChatJID: daruJID, Sender: "Daru",
+		Timestamp: time.Now(),
+		// Real, decodable bytes: the point is to prove the toggle changed
+		// what draws, which needs something that actually could draw.
+		Media: db.Media{Kind: db.MediaSticker, Thumbnail: testPNG(t, 40, 20)},
+	}}
+
+	drawnBefore := strings.Join(transcriptLines(page), "\n")
+	if strings.Contains(drawnBefore, "[sticker]") {
+		t.Fatal("test needs the sticker actually drawn to begin with")
+	}
+
+	opened, _ := page.handleKey(tea.KeyPressMsg{Code: 'g', Mod: tea.ModCtrl})
+	settings := opened.(SettingsPage)
+	// Row 1 is "Show stickers".
+	toggled, _ := settings.action(tea.KeyPressMsg{Code: tea.KeyDown})
+	toggled, _ = toggled.(SettingsPage).action(tea.KeyPressMsg{Code: tea.KeyEnter})
+
+	back, _ := toggled.action(tea.KeyPressMsg{Code: tea.KeyEscape})
+	page = back.(ConversationsPage)
+
+	drawnAfter := strings.Join(transcriptLines(page), "\n")
+	if !strings.Contains(drawnAfter, "[sticker]") {
+		t.Errorf("chat still draws the sticker after turning it off:\n%s", drawnAfter)
+	}
+}
+
+func transcriptLines(page ConversationsPage) []string {
+	lines := make([]string, 0)
+	for _, line := range page.transcript(60) {
+		lines = append(lines, stripANSIForTest.ReplaceAllString(line.text, ""))
+	}
+	return lines
 }
 
 // Sender JIDs written by older versions carried a device suffix, which matched
@@ -2532,7 +2821,7 @@ func TestTypedPathIsSentAsAFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	page := openConversationsPage(&app{messages: store, width: 96, height: 30})
+	page := openConversationsPage(&app{messages: store, width: 96, height: 30, showPhotos: true, showStickers: true})
 	page.chats = chats
 	opened, _ := page.openChat(0)
 	page = opened.(ConversationsPage)
@@ -2580,7 +2869,7 @@ func TestFilePickerAttachesAFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	page := openConversationsPage(&app{messages: store, width: 96, height: 30})
+	page := openConversationsPage(&app{messages: store, width: 96, height: 30, showPhotos: true, showStickers: true})
 	page.chats = chats
 	opened, _ := page.openChat(0)
 	page = opened.(ConversationsPage)
@@ -2651,7 +2940,7 @@ func TestFilePickerGoesUp(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	page := openConversationsPage(&app{width: 96, height: 30})
+	page := openConversationsPage(&app{width: 96, height: 30, showPhotos: true, showStickers: true})
 	page.browseDir = child
 	started, _ := page.openBrowser()
 	page = started.(ConversationsPage)

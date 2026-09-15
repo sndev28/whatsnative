@@ -65,7 +65,7 @@ func fixturePage(t *testing.T, width, height int) ConversationsPage {
 	t.Helper()
 
 	store := fixtureStore(t)
-	page := openConversationsPage(&app{messages: store, width: width, height: height})
+	page := openConversationsPage(&app{messages: store, width: width, height: height, showPhotos: true, showStickers: true})
 
 	chats, err := store.Chats()
 	if err != nil {
@@ -396,7 +396,7 @@ func TestFitCellsPreservesAspect(t *testing.T) {
 }
 
 func TestRenderWithNoChats(t *testing.T) {
-	page := openConversationsPage(&app{width: 80, height: 24})
+	page := openConversationsPage(&app{width: 80, height: 24, showPhotos: true, showStickers: true})
 
 	lines := strings.Split(page.render(), "\n")
 	if len(lines) != 24 {
@@ -438,7 +438,7 @@ func TestPanesHoldTheirWidthInEveryScript(t *testing.T) {
 	}
 
 	for _, width := range []int{60, 80, 100} {
-		page := openConversationsPage(&app{messages: store, width: width, height: 24})
+		page := openConversationsPage(&app{messages: store, width: width, height: 24, showPhotos: true, showStickers: true})
 		page.chats = chats
 		page.status = ""
 

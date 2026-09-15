@@ -2,13 +2,19 @@ package client
 
 import (
 	"database/sql"
+	"fmt"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+	"go.mau.fi/whatsmeow/proto/waCommon"
+	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/proto/waSyncAction"
+	"go.mau.fi/whatsmeow/proto/waWeb"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
@@ -175,5 +181,70 @@ func TestMarkChatAsUnreadDoesNothingLocally(t *testing.T) {
 	case evt := <-session.events:
 		t.Errorf("emitted %T for a mark-as-unread, want nothing", evt)
 	default:
+	}
+}
+
+// A history-sync blob is the largest thing this process holds. Go frees it
+// promptly but hands the pages back to the OS only lazily, so a first sync
+// after a long absence -- many blobs in a row -- left resident memory
+// climbing even though almost nothing was still reachable.
+//
+// This asserts the handler leaves the heap actually released rather than
+// merely unreachable, which is the difference the user feels.
+func TestHistorySyncReturnsMemoryToTheOS(t *testing.T) {
+	session, _ := testSession(t)
+	go func() {
+		for range session.events {
+		}
+	}()
+
+	// Enough messages that the blob is worth measuring at all.
+	const chats, perChat = 20, 400
+	convos := make([]*waHistorySync.Conversation, chats)
+	for c := range chats {
+		msgs := make([]*waHistorySync.HistorySyncMsg, perChat)
+		for i := range perChat {
+			msgs[i] = &waHistorySync.HistorySyncMsg{
+				Message: &waWeb.WebMessageInfo{
+					Key: &waCommon.MessageKey{
+						ID:          proto.String(fmt.Sprintf("m%d_%d", c, i)),
+						Participant: proto.String(daruJID),
+					},
+					MessageTimestamp: proto.Uint64(uint64(time.Now().Unix())),
+					Message: &waE2E.Message{Conversation: proto.String(
+						strings.Repeat("a typical message body ", 8))},
+				},
+			}
+		}
+		convos[c] = &waHistorySync.Conversation{
+			ID:       proto.String(fmt.Sprintf("%d@s.whatsapp.net", c)),
+			Name:     proto.String(fmt.Sprintf("Chat %d", c)),
+			Messages: msgs,
+		}
+	}
+
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+
+	session.onHistorySync(&events.HistorySync{Data: &waHistorySync.HistorySync{Conversations: convos}})
+
+	runtime.ReadMemStats(&after)
+
+	// The handler allocates tens of megabytes. If it returns without handing
+	// the pages back, HeapReleased barely moves; with FreeOSMemory it jumps.
+	released := float64(after.HeapReleased) - float64(before.HeapReleased)
+	if released <= 0 {
+		t.Errorf("the handler returned without releasing any memory to the OS (HeapReleased %d -> %d)",
+			before.HeapReleased, after.HeapReleased)
+	}
+	t.Logf("released %.1f MB back to the OS", released/1e6)
+
+	// And it still did the job it was called for.
+	chatRows, err := session.messages.Chats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chatRows) != chats {
+		t.Errorf("stored %d chats, want %d", len(chatRows), chats)
 	}
 }

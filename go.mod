@@ -12,6 +12,7 @@ require (
 	github.com/mattn/go-sqlite3 v1.14.49
 	github.com/mdp/qrterminal/v3 v3.2.1
 	github.com/rivo/uniseg v0.4.7
+	go.mau.fi/libsignal v0.2.2
 	go.mau.fi/whatsmeow v0.0.0-20260810134348-a23afe317180
 	golang.org/x/image v0.45.0
 	golang.org/x/sys v0.47.0
@@ -40,7 +41,6 @@ require (
 	github.com/rs/zerolog v1.35.1 // indirect
 	github.com/vektah/gqlparser/v2 v2.5.27 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
-	go.mau.fi/libsignal v0.2.2 // indirect
 	go.mau.fi/util v0.9.12-0.20260717235539-f9ffa7eca58d // indirect
 	golang.org/x/crypto v0.54.0 // indirect
 	golang.org/x/exp v0.0.0-20260709172345-9ea1abe57597 // indirect

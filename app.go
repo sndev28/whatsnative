@@ -11,8 +11,11 @@ import (
 const DB_NAME string = "my_database.db"
 
 func main() {
-	_, logCloser := logger.Logger("logs.log", true)
+	appLog, logCloser := logger.Logger("logs.log", true)
 	defer logCloser.Close()
+
+	// Off unless WHATSNATIVE_PPROF names an address to listen on.
+	startProfiler(appLog)
 
 	dbLog, dbLogCloser := logger.Logger("db.log", false)
 	defer dbLogCloser.Close()

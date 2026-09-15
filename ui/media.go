@@ -27,13 +27,29 @@ import (
 // are mostly transparent, so getting this wrong makes them look like blocks.
 const alphaFloor = 0x2000
 
-// imageCache keeps rendered images keyed by file and size.
+// imageCacheLimit caps how many distinct pictures stay cached before the
+// oldest are dropped. One rendered thumbnail is a few KB of escape-coded
+// text, so this bounds the cache at a few megabytes -- generous for anything
+// on screen at once, small next to what the image actually cost to decode.
+const imageCacheLimit = 500
+
+// imageCache keeps rendered images keyed by file. Only one box size is kept
+// at a time: every image on screen shares the same transcript width, so a
+// resize invalidates the whole cache at once rather than adding a second copy
+// of everything already in it under a new key. Without that, a session left
+// open across a few resizes over several days would keep every size it had
+// ever been, forever -- the images decoded were the same pictures, over and
+// over, never released.
 //
-// render runs on every frame, and scaling a photo takes milliseconds, so
-// without this the UI would visibly stutter whenever a picture was on screen.
+// order is the eviction queue: oldest key first. A cache hit does not
+// reorder it, so this is FIFO rather than true LRU -- simpler, and the
+// difference only matters for a working set close to the cap, where either
+// policy is already thrashing.
 var imageCache = struct {
 	sync.Mutex
-	rows map[string][]string
+	width, height int
+	rows          map[string][]string
+	order         []string
 }{rows: map[string][]string{}}
 
 // renderImage draws an image file as terminal rows that fit inside maxWidth
@@ -51,12 +67,7 @@ func renderImage(path string, maxWidth, maxHeight int) ([]string, error) {
 		return nil, fmt.Errorf("no room to draw")
 	}
 
-	key := fmt.Sprintf("%s|%dx%d", path, maxWidth, maxHeight)
-
-	imageCache.Lock()
-	cached, ok := imageCache.rows[key]
-	imageCache.Unlock()
-	if ok {
+	if cached, ok := imageCacheGet(path, maxWidth, maxHeight); ok {
 		return cached, nil
 	}
 
@@ -65,10 +76,43 @@ func renderImage(path string, maxWidth, maxHeight int) ([]string, error) {
 		return nil, err
 	}
 
-	imageCache.Lock()
-	imageCache.rows[key] = rows
-	imageCache.Unlock()
+	imageCachePut(path, maxWidth, maxHeight, rows)
 	return rows, nil
+}
+
+func imageCacheGet(path string, width, height int) ([]string, bool) {
+	imageCache.Lock()
+	defer imageCache.Unlock()
+
+	if imageCache.width != width || imageCache.height != height {
+		return nil, false
+	}
+	rows, ok := imageCache.rows[path]
+	return rows, ok
+}
+
+func imageCachePut(path string, width, height int, rows []string) {
+	imageCache.Lock()
+	defer imageCache.Unlock()
+
+	if imageCache.width != width || imageCache.height != height {
+		// The box has changed size. Every entry under the old one is for a box
+		// nothing will ever ask for again, so there is nothing worth keeping.
+		imageCache.rows = make(map[string][]string, imageCacheLimit)
+		imageCache.order = imageCache.order[:0]
+		imageCache.width, imageCache.height = width, height
+	}
+
+	if _, exists := imageCache.rows[path]; !exists {
+		imageCache.order = append(imageCache.order, path)
+	}
+	imageCache.rows[path] = rows
+
+	for len(imageCache.order) > imageCacheLimit {
+		oldest := imageCache.order[0]
+		imageCache.order = imageCache.order[1:]
+		delete(imageCache.rows, oldest)
+	}
 }
 
 func drawImage(path string, maxWidth, maxHeight int) ([]string, error) {

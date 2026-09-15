@@ -18,6 +18,14 @@ type app struct {
 
 	width  int
 	height int
+
+	// showPhotos and showStickers gate decoding pictures at all. Off, a
+	// message draws as its [photo]/[sticker] chip instead. These live here
+	// rather than on ConversationsPage because the settings page has to read
+	// and change them without losing whatever the conversation page's own
+	// state was on the way in -- see openSettingsPage.
+	showPhotos   bool
+	showStickers bool
 }
 
 type viewPort struct {
@@ -82,6 +90,14 @@ func StartUI(session *client.Session, messages *db.MessageStore) {
 		width:  80,
 		height: 24,
 	}
+
+	// Read once, synchronously: this is a single-row lookup against a table
+	// that is empty until a setting is actually changed, so it costs nothing
+	// worth a tea.Cmd for, and pictureRows needs an answer before the first
+	// frame draws regardless. A failed read falls back to on, same as a
+	// setting that has simply never been touched.
+	a.showPhotos, _ = messages.ShowPhotos()
+	a.showStickers, _ = messages.ShowStickers()
 
 	// Work out which ruler Bubble Tea is going to measure with, while the
 	// ordinary screen is still ours to ask questions on.
